@@ -1,7 +1,7 @@
 ##LSTM or CNN gemini LEREC v5 with BatchNorm + MaxPool + max voltage limit + dynamic step size
-## The plots shown on the test file voltage simulation are normalized.
+## The plots shown on the test file voltage simulation are normalized to max and min limits of each file.
 
-## included class decision boundary plots for 
+## 
 
 import torch
 import torch.nn as nn
@@ -44,9 +44,12 @@ except Exception:
 
 def find_global_max_voltage(folder_path, voltage_col='glassmanDataXfer:hvPsVoltageMeasM'):
     """
-    WHAT: Determines the absolute safety limit (Max Voltage) of the Gun.
+    WHAT: Determines the absolute Maximum Voltage of the Gun from the training data.
     HOW:  Scans every CSV in the training folder, reads ONLY the voltage column,
           and finds the global maximum. This is passed to the Simulation as a hard Interlock.
+
+    Inputs: Training folder path, voltage column name.
+    Outputs: Maximum voltage (float).
     """
     print(f"--- Scanning {folder_path} for Max Voltage Limit ---")
     all_files = glob.glob(os.path.join(folder_path, "*.csv"))
@@ -71,9 +74,12 @@ def find_global_max_voltage(folder_path, voltage_col='glassmanDataXfer:hvPsVolta
 
 def calculate_average_step_size(folder_path, voltage_col='glassmanDataXfer:hvPsVoltageMeasM', target_col='VoltageChange'):
     """
-    WHAT: Calculates the physics of the ramp (How many Volts does a 'Step Up' actually add?).
+    WHAT: Calculates the average step size of the training files for increasing the voltage.
     HOW:  It aligns row t (Command=1) with row t+1 (Voltage).
           It calculates V(t+1) - V(t) for every successful ramp and averages them.
+
+    Inputs: Training folder path, voltage column name, VoltageChange column name.
+    Outputs: Average step size (float).
     """
     print(f"--- Calculating Average Step Size from {folder_path} ---")
     all_files = glob.glob(os.path.join(folder_path, "*.csv"))
@@ -109,9 +115,18 @@ def calculate_average_step_size(folder_path, voltage_col='glassmanDataXfer:hvPsV
 
 
 
+
+"""
+The three functions below implement the "Quiet Negative" filtering logic i.e. if the system is stable wrt the three sensors
+(GunCurrent.Avg","peg-BL-cc:pressureM","RadiationTotal), and the voltage change is 0, we skip that sample during training.
+
+This is expected to increase the model's accuracy and focus on learning the ramp-up events. 
+
+STILL NEED TO FIND A PERFECT NOISE FUNCTION TO RECTIFY. AS OF NOW, NO DATA IS BEING FILTERED OUT DURING TRAINING.
+"""
 def robust_noise_sigma_mad_diff(series: pd.Series):
     """
-    Robust noise sigma estimate using MAD of first differences.
+    Robust noise sigma estimate using Medium Absolute Deviation of first differences.
     """
     x = pd.to_numeric(series, errors='coerce').dropna()
     if len(x) < 5:
@@ -213,6 +228,8 @@ def should_skip_quiet_negative(df, idx, noise_thresholds, voltage_limit=None):
 # ==========================================
 
 def read_folder_csvs(folder_path):
+
+    ## Reads the csv files from a folder into a list of dataframes.
     all_files = glob.glob(os.path.join(folder_path, "*.csv"))
     dfs = []
     for filename in all_files:
@@ -232,6 +249,20 @@ def process_single_df_to_sequences(df, scaler, sequence_length,
     # 0. Pre-processing: Find Time Column and Resample for Gaps
     # We look for case-insensitive 'time' column
 
+
+
+    """
+    Reads the time column and removes any duplicates.
+    Checks for any NaNs in VoltageChange before and after time handling.
+    If VoltageChange column has NaNs introduced after time handling, those rows will be skipped later.
+    If VoltageChange column has '-1', those will be mapped to '0' and the next 5-steps will also be read as '0'.
+    Uses normalized values for inputs of current, pressure, radiation.
+    Inputs: DataFrame, fitted scaler, sequence length, noise thresholds, filter flag.
+    Outputs: X_sequences (NumPy array), y_sequences (NumPy array) (training data inputs and voltagechange)
+
+    Used  by: prepare_all_data(), test_single_file_simulation()
+    
+    """
     df = df.copy()
 
 # -------- DEBUG: BEFORE time handling ----------
@@ -434,6 +465,17 @@ def prepare_all_data(train_folder, test_folder, sequence_length,
 
     """
     WHAT: Orchestrates data loading, scaling, and splitting.
+
+    Reads csv files from train and test folders,
+    Processes them into sequences using process_single_df_to_sequences(),
+    Splits the training data into train and validation sets
+    Calculates class weights for imbalanced data.
+
+    Inputs: Train folder path, Test folder path, sequence length,
+    Outputs: data dict (X_train, y_train, X_val, y_val, X_test, y_test),
+
+    X_* are torch FloatTensors of shape (Samples, Seq_Len, Features) (inputs for the model)
+    y_* are torch FloatTensors of shape (Samples, 1) (Our final target: VoltageChange)
     """
     print(f"Loading Data...")
     train_dfs = read_folder_csvs(train_folder)
@@ -515,7 +557,10 @@ def prepare_all_data(train_folder, test_folder, sequence_length,
 # ==========================================
 # 3. Model Architecture (CNN + BN + Pool)
 # ==========================================
+""""
+Defines CNN and LSTM models using PyTorch.
 
+Outputs: model layers in dicts, forward functions."""
 
 # --- LSTM MODEL ---
 def create_lstm_model(input_dim, hidden_dim):
@@ -534,6 +579,8 @@ def create_cnn_model(input_dim, seq_len):
     """
     WHAT: Defines the Neural Network structure.
     ARCH: Conv1d -> BatchNorm -> ReLU -> MaxPool -> Flatten -> Linear
+
+    Output: All the layers in a dict for easy access.
     """
     # Define Filter Sizes to avoid mismatches
     n_filters1 = 128
@@ -629,6 +676,16 @@ def summarize_model_parameters(models, model_type="cnn"):
 # ==========================================
 
 def train_model(model_type, data, pos_weight, epochs=60, batch_size=128):
+
+    """
+    Training loop for the model.
+    Creates the models LSTM and CNN based on model_type.
+    Uses Adam optimizer and BCEWithLogitsLoss with pos_weight for imbalance.
+    Inputs: model_type ('cnn' or 'lstm'), data dict, pos_weight tensor, epochs, batch_size
+    Outputs: trained models dict, forward function, training history dict
+
+    Prints: training and validation loss/accuracy per epoch.
+    """ 
     X_train, y_train = data['X_train'], data['y_train']
     X_val, y_val = data['X_val'], data['y_val']
     
@@ -724,7 +781,26 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128):
 # 5. Evaluation Metrics 
 # ==========================================
 
+
+## Evaluation Metrics are only for the test set after training is complete.
+## All the functions below implement evaluation metrics and helps with visualizations.
+## They can be commented out in the __main__ script if not needed.
+## SOME FUNCTIONS STILL NEED TO BE ADDED OR FIXED FOR BETTER VISUALIZATIONS.
+
+"""
+
+    Evaluates the trained model on the test set.
+    Calculates loss, accuracy, precision, recall, confusion matrix.
+    Inputs: trained models dict, forward function, data dict, pos_weight tensor
+    Outputs: prints evaluation metrics.
+
+   """
+
 def evaluate_test_set(models, forward_fn, data, pos_weight):
+
+   
+
+
     print("\n" + "="*30)
     print("EVALUATING ON TEST SET")
     print("="*30)
@@ -783,6 +859,9 @@ def extract_last_step_three_features(X, scaler):
     Extracts (current, pressure, radiation) from the LAST timestep of each sequence.
     X shape: (N, Seq, 7)
     Returns raw (inverse-scaled) physical values.
+
+    Used by: plot_3d_real_labels(), plot_3d_predicted_labels()
+    The plot_3d_* functions still need to be fixed or understood properly for better visualization.
     """
     if isinstance(X, torch.Tensor):
         X_np = X.detach().cpu().numpy()
@@ -802,6 +881,10 @@ def extract_last_step_three_features(X, scaler):
 
 from mpl_toolkits.mplot3d import Axes3D
 
+##############################################################################
+#### 3d PLOTTING for vizualtion. NEED TO BE FIXED OR UNDERSTOOD PROPERLY.
+#### Ignore from Line 886 until Line 1120.
+###############################################################################
 def _set_3d_origin_and_view(ax, x, y, z, start_from_zero=True, pad=0.05, elev=25, azim=35):
     """
     Helper to control axis limits and view orientation.
@@ -1035,7 +1118,7 @@ def plot_decision_boundary_slices(models, forward_fn, data, scaler, seq_len,
             plot_one_overlay(rad_fixed, "pred")
 
 
-
+#####################################################################################
 def plot_training_curves(history):
     """
     Plots the Loss and Accuracy curves after training.
@@ -1061,6 +1144,10 @@ def plot_training_curves(history):
     plt.grid(True)
     plt.show()
 
+
+###########################################################################
+
+#### Ignore from Line 1150 until Line 1330.
 def build_sequences_with_indices_for_plot(df, scaler, sequence_length):
     """
     Lightweight sequence builder for plotting.
@@ -1239,7 +1326,7 @@ def plot_decision_boundary_slices_shaded(models, forward_fn, data, scaler, seq_l
         plt.tight_layout()
         plt.show()
 
-
+##################################################################################################
 
 def plot_test_file_trends(filepath, models, forward_fn, scaler, sequence_length):
     
@@ -1520,7 +1607,7 @@ if __name__ == "__main__":
 
     # TRAIN_DIR = r"C:\Users\skantamne\Downloads\PhD EGun\Data\Archive 2\gun_conditioning_spike_cleaned\v8 spikes cleaned until max\training" 
     # TEST_DIR = r"C:\Users\skantamne\Downloads\PhD EGun\Data\Archive 2\gun_conditioning_spike_cleaned\v8 spikes cleaned until max\testing"
-    SEQ_LEN = 20
+    SEQ_LEN = 30
 
     FEATURE_COLS = ["GunCurrent.Avg","peg-BL-cc:pressureM","RadiationTotal"]
 
