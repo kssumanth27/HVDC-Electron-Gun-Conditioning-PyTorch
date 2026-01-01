@@ -2,7 +2,8 @@
 ## The plots shown on the test file voltage simulation are normalized to max and min limits of each file.
 
 ## 
-
+import os
+os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -675,7 +676,7 @@ def summarize_model_parameters(models, model_type="cnn"):
 # 4. Training Loop
 # ==========================================
 
-def train_model(model_type, data, pos_weight, epochs=60, batch_size=128):
+def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.000005):
 
     """
     Training loop for the model.
@@ -707,7 +708,7 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128):
         forward_fn = forward_cnn
     params = [p for layer in models.values() for p in layer.parameters()]
 
-    optimizer = optim.Adam(params, lr=0.000005)
+    optimizer = optim.Adam(params, lr=lr)
     
         # --- DEBUG: print model parameter summary ---
     summarize_model_parameters(models, model_type=model_type)
@@ -954,7 +955,9 @@ def plot_3d_real_labels(X, y, scaler, title="Real Labels in Feature Space",
                             start_from_zero=start_from_zero, elev=elev, azim=azim)
 
     plt.tight_layout()
-    plt.show()
+    filename = f"../results/{title.replace(' ', '_').lower()}.png"
+    plt.savefig(filename)
+    plt.close()
 
 
 def plot_3d_predicted_labels(models, forward_fn, X, y, scaler,
@@ -991,7 +994,9 @@ def plot_3d_predicted_labels(models, forward_fn, X, y, scaler,
                             start_from_zero=start_from_zero, elev=elev, azim=azim)
 
     plt.tight_layout()
-    plt.show()
+    filename = f"../results/{title.replace(' ', '_').lower()}.png"
+    plt.savefig(filename)
+    plt.close()
 
 
 def make_constant_sequence(curr, pres, rad, scaler, seq_len):
@@ -1105,7 +1110,9 @@ def plot_decision_boundary_slices(models, forward_fn, data, scaler, seq_len,
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.show()
+        filename = f"../results/decision_boundary_slice_rad_{rad_fixed:.3f}_{label_mode}.png"
+        plt.savefig(filename)
+        plt.close()
 
     # Render according to overlay option
     for rad_fixed in rad_levels:
@@ -1142,7 +1149,8 @@ def plot_training_curves(history):
     plt.ylabel('Accuracy')
     plt.legend()
     plt.grid(True)
-    plt.show()
+    plt.savefig("../results/training_curves.png")
+    plt.close()
 
 
 ###########################################################################
@@ -1324,7 +1332,9 @@ def plot_decision_boundary_slices_shaded(models, forward_fn, data, scaler, seq_l
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        plt.show()
+        filename = f"../results/decision_boundary_slice_shaded_rad_{rad_fixed:.3f}_{overlay}_{use_set}.png"
+        plt.savefig(filename)
+        plt.close()
 
 ##################################################################################################
 
@@ -1456,7 +1466,9 @@ def plot_test_file_trends(filepath, models, forward_fn, scaler, sequence_length)
 
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    plt.show()
+    filename = f"../results/test_file_trends_{os.path.basename(filepath)}.png"
+    plt.savefig(filename)
+    plt.close()
 
 
 
@@ -1592,7 +1604,9 @@ def test_single_file_simulation(filepath, models, forward_fn, scaler, sequence_l
     plt.ylabel("Normalized Voltage (0–1)")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    plt.show()
+    filename = f"../results/simulation_vs_real_{os.path.basename(filepath)}.png"
+    plt.savefig(filename)
+    plt.close()
 
 
 # ==========================================
@@ -1600,10 +1614,11 @@ def test_single_file_simulation(filepath, models, forward_fn, scaler, sequence_l
 # ==========================================
 
 if __name__ == "__main__":
+    os.makedirs("../results", exist_ok=True)
     
     # UPDATE YOUR PATHS HERE
-    TRAIN_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\training" 
-    TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\testing"
+    TRAIN_DIR = r"../data/polarized_gun/training" 
+    TEST_DIR = r"../data/polarized_gun/testing"
 
     # TRAIN_DIR = r"C:\Users\skantamne\Downloads\PhD EGun\Data\Archive 2\gun_conditioning_spike_cleaned\v8 spikes cleaned until max\training" 
     # TEST_DIR = r"C:\Users\skantamne\Downloads\PhD EGun\Data\Archive 2\gun_conditioning_spike_cleaned\v8 spikes cleaned until max\testing"
