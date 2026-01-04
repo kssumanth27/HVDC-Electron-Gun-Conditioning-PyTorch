@@ -4,6 +4,8 @@
 ## 
 import os
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
+os.environ['KMP_WARNINGS'] = '0'
+os.environ['MKL_CBWR'] = 'AUTO'
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -614,7 +616,27 @@ def create_cnn_model(input_dim, seq_len):
     linear = nn.Linear(linear_input_size, 1)
 
     return {'conv1': conv1, 'bn1': bn1, 'conv2': conv2, 'bn2': bn2, 'pool':pool, 'linear': linear}   
-
+'''
+def initialize_weights(models):
+    """Explicitly sets initial weights for all layers in the dictionary."""
+    for name, layer in models.items():
+        if isinstance(layer, (nn.Conv1d, nn.Linear)):
+            # Kaiming Normal is excellent for ReLU activations
+            nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
+            if layer.bias is not None:
+                nn.init.constant_(layer.bias, 0)
+        elif isinstance(layer, nn.LSTM): # Initialize LSTM weights using orthogonal and xavier
+            for name, param in layer.named_parameters():
+                if 'weight_ih' in name:
+                    nn.init.xavier_uniform_(param.data)
+                elif 'weight_hh' in name:
+                    nn.init.orthogonal_(param.data)
+                elif 'bias' in name:
+                    nn.init.constant_(param.data, 0)
+        elif isinstance(layer, nn.BatchNorm1d):
+            nn.init.constant_(layer.weight, 1)
+            nn.init.constant_(layer.bias, 0)
+'''
 def forward_cnn(models, x):
     # Permute: PyTorch Conv1d expects [Batch, Channels, Time]
     x = x.permute(0, 2, 1) 
@@ -678,6 +700,7 @@ def summarize_model_parameters(models, model_type="cnn"):
 
 def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.000005):
 
+# def train_model(model_type, data, pos_weight, epochs=60, batch_size=128):
     """
     Training loop for the model.
     Creates the models LSTM and CNN based on model_type.
@@ -706,6 +729,10 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.00
         print("Initializing CNN Model...")
         models = create_cnn_model(input_dim, seq_len)
         forward_fn = forward_cnn
+    
+    # Set the initial weights explicitly
+    # initialize_weights(models)
+
     params = [p for layer in models.values() for p in layer.parameters()]
 
     optimizer = optim.Adam(params, lr=lr)
@@ -732,7 +759,12 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.00
              models['conv2'].train()
              models['bn2'].train()
              #models['conv3'].train()
-   
+        '''
+        # --- TRAIN LOOP (Mini-Batches) ---
+        # This loop works for BOTH CNN and LSTM dictionaries automatically
+        for layer in models.values():
+            layer.train()
+        ''' 
         
         epoch_loss = 0.0
         for batch_X, batch_y in train_loader:
@@ -816,7 +848,13 @@ def evaluate_test_set(models, forward_fn, data, pos_weight):
     # Set Eval Mode
     models['conv1'].eval(); models['bn1'].eval()
     models['conv2'].eval(); models['bn2'].eval()
-    
+
+   
+ # Set new Eval Mode
+    '''
+    for layer in models.values():
+        layer.eval()
+    '''
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     with torch.no_grad():
