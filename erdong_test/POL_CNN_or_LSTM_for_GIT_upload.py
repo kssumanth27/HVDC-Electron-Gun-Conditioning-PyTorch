@@ -616,7 +616,6 @@ def create_cnn_model(input_dim, seq_len):
     linear = nn.Linear(linear_input_size, 1)
 
     return {'conv1': conv1, 'bn1': bn1, 'conv2': conv2, 'bn2': bn2, 'pool':pool, 'linear': linear}   
-'''
 def initialize_weights(models):
     """Explicitly sets initial weights for all layers in the dictionary."""
     for name, layer in models.items():
@@ -636,7 +635,6 @@ def initialize_weights(models):
         elif isinstance(layer, nn.BatchNorm1d):
             nn.init.constant_(layer.weight, 1)
             nn.init.constant_(layer.bias, 0)
-'''
 def forward_cnn(models, x):
     # Permute: PyTorch Conv1d expects [Batch, Channels, Time]
     x = x.permute(0, 2, 1) 
@@ -700,7 +698,6 @@ def summarize_model_parameters(models, model_type="cnn"):
 
 def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.000005):
 
-# def train_model(model_type, data, pos_weight, epochs=60, batch_size=128):
     """
     Training loop for the model.
     Creates the models LSTM and CNN based on model_type.
