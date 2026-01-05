@@ -4,11 +4,6 @@
 ## 
 import os
 os.environ['MKL_SERVICE_FORCE_INTEL'] = '1'
-os.environ['MKL_DEBUG_CPU_TYPE'] = '5'
-os.environ['MKL_ENABLE_INSTRUCTIONS'] = 'SSE4_2'
-os.environ['KMP_WARNINGS'] = '0'
-os.environ['MKL_CBWR'] = 'AUTO'
-os.environ['MKL_WARN'] = '0'
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
@@ -17,6 +12,7 @@ from torch.utils.data import DataLoader, TensorDataset  # <--- ADDED
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
+import os
 import glob
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
@@ -510,13 +506,7 @@ def prepare_all_data(train_folder, test_folder, sequence_length,
     y_train_all = np.concatenate(y_train_list)
     
     X_train, X_val, y_train, y_val = train_test_split(X_train_all, y_train_all, test_size=0.15, shuffle=True, random_state=97)
-    '''
-# We use a contiguous split to ensure the validation set is truly "unseen" time-wise.
-    split_idx = int(len(X_train_all) * 0.85)
-    X_train, X_val = X_train_all[:split_idx], X_train_all[split_idx:]
-    y_train, y_val = y_train_all[:split_idx], y_train_all[split_idx:]
-    # X_train, X_val, y_train, y_val = train_test_split(X_train_all, y_train_all, test_size=0.15, shuffle=True, random_state=97)
-    '''   
+    
     print("Processing Test Sequences...")
     X_test_list, y_test_list = [], []
     for df in test_dfs:
@@ -624,25 +614,7 @@ def create_cnn_model(input_dim, seq_len):
     linear = nn.Linear(linear_input_size, 1)
 
     return {'conv1': conv1, 'bn1': bn1, 'conv2': conv2, 'bn2': bn2, 'pool':pool, 'linear': linear}   
-def initialize_weights(models):
-    """Explicitly sets initial weights for all layers in the dictionary."""
-    for name, layer in models.items():
-        if isinstance(layer, (nn.Conv1d, nn.Linear)):
-            # Kaiming Normal is excellent for ReLU activations
-            nn.init.kaiming_normal_(layer.weight, nonlinearity='relu')
-            if layer.bias is not None:
-                nn.init.constant_(layer.bias, 0)
-        elif isinstance(layer, nn.LSTM): # Initialize LSTM weights using orthogonal and xavier
-            for name, param in layer.named_parameters():
-                if 'weight_ih' in name:
-                    nn.init.xavier_uniform_(param.data)
-                elif 'weight_hh' in name:
-                    nn.init.orthogonal_(param.data)
-                elif 'bias' in name:
-                    nn.init.constant_(param.data, 0)
-        elif isinstance(layer, nn.BatchNorm1d):
-            nn.init.constant_(layer.weight, 1)
-            nn.init.constant_(layer.bias, 0)
+
 def forward_cnn(models, x):
     # Permute: PyTorch Conv1d expects [Batch, Channels, Time]
     x = x.permute(0, 2, 1) 
@@ -704,7 +676,7 @@ def summarize_model_parameters(models, model_type="cnn"):
 # 4. Training Loop
 # ==========================================
 
-def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.000005):
+def train_model(model_type, data, pos_weight, epochs=60, batch_size=128):
 
     """
     Training loop for the model.
@@ -734,13 +706,9 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.00
         print("Initializing CNN Model...")
         models = create_cnn_model(input_dim, seq_len)
         forward_fn = forward_cnn
-    
-    # Set the initial weights explicitly
-    # initialize_weights(models)
-
     params = [p for layer in models.values() for p in layer.parameters()]
 
-    optimizer = optim.Adam(params, lr=lr)
+    optimizer = optim.Adam(params, lr=0.000005)
     
         # --- DEBUG: print model parameter summary ---
     summarize_model_parameters(models, model_type=model_type)
@@ -751,11 +719,10 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.00
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
     history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
- 
+
     for epoch in range(epochs):
         
         # --- TRAIN LOOP (Mini-Batches) ---
-        '''
         if model_type == 'lstm':
              models['lstm'].train() 
         else:
@@ -765,18 +732,7 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.00
              models['conv2'].train()
              models['bn2'].train()
              #models['conv3'].train()
-        '''
-        # Manual calls made safer for both CNN and LSTM
-        if 'conv1' in models:
-            models['conv1'].train(); models['bn1'].train()
-            models['conv2'].train(); models['bn2'].train()
-        if 'lstm' in models: models['lstm'].train()
-        # --- TRAIN LOOP (Mini-Batches) ---
-        # This loop works for BOTH CNN and LSTM dictionaries automatically
-        '''
-        for layer in models.values():
-            layer.train()
-        ''' 
+   
         
         epoch_loss = 0.0
         for batch_X, batch_y in train_loader:
@@ -799,10 +755,8 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128, lr=0.00
              models['conv2'].eval()
              models['bn2'].eval()
              #models['conv3'].eval()
-        ''' 
-        for layer in models.values():
-            layer.eval()
-        '''
+        
+      
         with torch.no_grad():
             val_preds = forward_fn(models, X_val)
             v_loss = criterion(val_preds, y_val)
@@ -859,22 +813,10 @@ def evaluate_test_set(models, forward_fn, data, pos_weight):
         print("Test set is empty. Cannot evaluate.")
         return
 
-    # 010526 Set Eval Mode
-    #models['conv1'].eval(); models['bn1'].eval()
-    #models['conv2'].eval(); models['bn2'].eval()
-    # Manual calls made safer for both CNN and LSTM
+    # Set Eval Mode
+    models['conv1'].eval(); models['bn1'].eval()
+    models['conv2'].eval(); models['bn2'].eval()
     
-    if 'conv1' in models:
-        models['conv1'].eval(); models['bn1'].eval()
-        models['conv2'].eval(); models['bn2'].eval()
-    if 'lstm' in models: models['lstm'].eval()
-    
-   
- # Set new Eval Mode
-    '''
-    for layer in models.values():
-        layer.eval()
-    '''
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     with torch.no_grad():
@@ -1013,9 +955,7 @@ def plot_3d_real_labels(X, y, scaler, title="Real Labels in Feature Space",
                             start_from_zero=start_from_zero, elev=elev, azim=azim)
 
     plt.tight_layout()
-    filename = f"../results/{title.replace(' ', '_').lower()}.png"
-    plt.savefig(filename)
-    plt.close()
+    plt.show()
 
 
 def plot_3d_predicted_labels(models, forward_fn, X, y, scaler,
@@ -1052,9 +992,7 @@ def plot_3d_predicted_labels(models, forward_fn, X, y, scaler,
                             start_from_zero=start_from_zero, elev=elev, azim=azim)
 
     plt.tight_layout()
-    filename = f"../results/{title.replace(' ', '_').lower()}.png"
-    plt.savefig(filename)
-    plt.close()
+    plt.show()
 
 
 def make_constant_sequence(curr, pres, rad, scaler, seq_len):
@@ -1168,9 +1106,7 @@ def plot_decision_boundary_slices(models, forward_fn, data, scaler, seq_len,
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        filename = f"../results/decision_boundary_slice_rad_{rad_fixed:.3f}_{label_mode}.png"
-        plt.savefig(filename)
-        plt.close()
+        plt.show()
 
     # Render according to overlay option
     for rad_fixed in rad_levels:
@@ -1207,8 +1143,7 @@ def plot_training_curves(history):
     plt.ylabel('Accuracy')
     plt.legend()
     plt.grid(True)
-    plt.savefig("../results/training_curves.png")
-    plt.close()
+    plt.show()
 
 
 ###########################################################################
@@ -1390,9 +1325,7 @@ def plot_decision_boundary_slices_shaded(models, forward_fn, data, scaler, seq_l
         plt.legend()
         plt.grid(True, alpha=0.3)
         plt.tight_layout()
-        filename = f"../results/decision_boundary_slice_shaded_rad_{rad_fixed:.3f}_{overlay}_{use_set}.png"
-        plt.savefig(filename)
-        plt.close()
+        plt.show()
 
 ##################################################################################################
 
@@ -1524,9 +1457,7 @@ def plot_test_file_trends(filepath, models, forward_fn, scaler, sequence_length)
 
 
     plt.tight_layout(rect=[0, 0, 1, 0.95])
-    filename = f"../results/test_file_trends_{os.path.basename(filepath)}.png"
-    plt.savefig(filename)
-    plt.close()
+    plt.show()
 
 
 
@@ -1554,6 +1485,10 @@ def test_single_file_simulation(filepath, models, forward_fn, scaler, sequence_l
         return
 
     X_tensor = torch.FloatTensor(X_seq)
+    
+    # # Eval Mode
+    # models['conv1'].eval(); models['bn1'].eval()
+    # models['conv2'].eval(); models['bn2'].eval()
     
     with torch.no_grad():
         logits = forward_fn(models, X_tensor)
@@ -1658,9 +1593,7 @@ def test_single_file_simulation(filepath, models, forward_fn, scaler, sequence_l
     plt.ylabel("Normalized Voltage (0–1)")
     plt.legend()
     plt.grid(True, alpha=0.3)
-    filename = f"../results/simulation_vs_real_{os.path.basename(filepath)}.png"
-    plt.savefig(filename)
-    plt.close()
+    plt.show()
 
 
 # ==========================================
@@ -1668,11 +1601,10 @@ def test_single_file_simulation(filepath, models, forward_fn, scaler, sequence_l
 # ==========================================
 
 if __name__ == "__main__":
-    os.makedirs("../results", exist_ok=True)
     
     # UPDATE YOUR PATHS HERE
-    TRAIN_DIR = r"../data/polarized_gun/training" 
-    TEST_DIR = r"../data/polarized_gun/testing"
+    TRAIN_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\training" 
+    TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\testing"
 
     # TRAIN_DIR = r"C:\Users\skantamne\Downloads\PhD EGun\Data\Archive 2\gun_conditioning_spike_cleaned\v8 spikes cleaned until max\training" 
     # TEST_DIR = r"C:\Users\skantamne\Downloads\PhD EGun\Data\Archive 2\gun_conditioning_spike_cleaned\v8 spikes cleaned until max\testing"
