@@ -52,7 +52,31 @@ except Exception:
 
 
 # ==========================================
-# 0. Sensor Dropout Function for Training Augmentation
+# 0. Missing Data Detection Helper
+# ==========================================
+
+def get_missing_mask(X_data, missing_value=-100.0, sensor_channels=(0, 1, 2)):
+    """
+    Detects which samples already have missing (naturally absent) sensor data.
+    
+    Args:
+        X_data: Tensor of shape [N, seq_len, n_channels]
+        missing_value: The sentinel value used for missing data (default -100.0)
+        sensor_channels: Tuple of sensor channel indices to check (default (0, 1, 2))
+    
+    Returns:
+        mask: Boolean tensor of shape [N, len(sensor_channels)]
+              mask[i, ch_idx] = True if sample i has ANY timestep in sensor_channels[ch_idx]
+              equal to missing_value.
+    """
+    mask = torch.zeros(X_data.shape[0], len(sensor_channels), dtype=torch.bool)
+    for idx, ch in enumerate(sensor_channels):
+        mask[:, idx] = (X_data[:, :, ch] == missing_value).any(dim=1)
+    return mask
+
+
+# ==========================================
+# 0.1 Sensor Dropout Function for Training Augmentation
 # ==========================================
 
 def apply_sensor_dropout(batch_x, prob_full_missing=0.2, prob_block_missing=0.3,
@@ -728,34 +752,43 @@ def forward_lstm(models, x):
     return models['linear'](lstm_out[:, -1, :])
 
 
-def create_cnn_model(input_dim, seq_len):
+def create_cnn_model(
+    input_dim,
+    seq_len,
+    n_filters1: int = 128,
+    n_filters2: int = 256,
+    kernel_size: int = 3,
+    pool_size: int = 2,
+):
     """
     WHAT: Defines the Neural Network structure.
     ARCH: Conv1d -> BatchNorm -> ReLU -> MaxPool -> Flatten -> Linear
 
     Output: All the layers in a dict for easy access.
+
+    The default values for n_filters1, n_filters2, kernel_size, and pool_size
+    are chosen to match the original architecture. They can be overridden
+    by passing explicit values (e.g. from a hyperparameter dict).
     """
-    # Define Filter Sizes to avoid mismatches
-    n_filters1 = 128
-    n_filters2 = 256
     
     # Block 1: Feature Extraction (Low level)
-    conv1 = nn.Conv1d(input_dim, n_filters1, kernel_size=3, padding=1)
+    # Use padding so that length is preserved for odd kernel sizes.
+    conv1 = nn.Conv1d(input_dim, n_filters1, kernel_size=kernel_size, padding=kernel_size // 2)
     bn1 = nn.BatchNorm1d(n_filters1) # Normalizes activations for stability
     
     # Block 2: Feature Extraction (High level)
-    conv2 = nn.Conv1d(n_filters1, n_filters2, kernel_size=3, padding=1)
+    conv2 = nn.Conv1d(n_filters1, n_filters2, kernel_size=kernel_size, padding=kernel_size // 2)
     bn2 = nn.BatchNorm1d(n_filters2)
     
     # Pooling: Shrinks time dimension by half (Downsampling)
-    pool = nn.MaxPool1d(kernel_size=2, stride=2)
+    pool = nn.MaxPool1d(kernel_size=pool_size, stride=pool_size)
     
     # --- LINEAR LAYER SIZING MATH ---
     # Logic: We must calculate exactly how many neurons are left after flattening.
-    # Pool 1 reduces length: 25 -> 12
-    len_after_pool1 = seq_len // 2
-    # Pool 2 reduces length: 12 -> 6
-    len_after_pool2 = len_after_pool1 // 2
+    # Pool 1 reduces length: 25 -> 12 (for pool_size=2)
+    len_after_pool1 = seq_len // pool_size
+    # Pool 2 reduces length: 12 -> 6 (for pool_size=2)
+    len_after_pool2 = len_after_pool1 // pool_size
     
     # Total inputs = Filters * Remaining Time Steps
     linear_input_size = n_filters2 * len_after_pool2
@@ -837,9 +870,24 @@ def summarize_model_parameters(models, model_type="cnn"):
 # 4. Training Loop
 # ==========================================
 
-def train_model(model_type, data, pos_weight, epochs=60, batch_size=128,
-                prob_full_missing=0.2, prob_block_missing=0.3,
-                min_block_pct=0.2, max_block_pct=0.8, missing_value=-100.0):
+def train_model(
+    model_type,
+    data,
+    pos_weight,
+    epochs: int = 60,
+    batch_size: int = 128,
+    learning_rate: float = 0.0001,
+    n_filters1: int = 128,
+    n_filters2: int = 256,
+    kernel_size: int = 3,
+    pool_size: int = 2,
+    hidden_dim: int = 64,
+    prob_full_missing: float = 0.2,
+    prob_block_missing: float = 0.3,
+    min_block_pct: float = 0.2,
+    max_block_pct: float = 0.8,
+    missing_value: float = -100.0,
+):
 
     """
     Training loop for the model.
@@ -874,11 +922,18 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128,
    # --- MODEL SWITCHING LOGIC RESTORED ---
     if model_type == 'lstm':
         print("Initializing LSTM Model...")
-        models = create_lstm_model(input_dim, hidden_dim=64)
+        models = create_lstm_model(input_dim, hidden_dim=hidden_dim)
         forward_fn = forward_lstm
     else:
         print("Initializing CNN Model...")
-        models = create_cnn_model(input_dim, seq_len)
+        models = create_cnn_model(
+            input_dim,
+            seq_len,
+            n_filters1=n_filters1,
+            n_filters2=n_filters2,
+            kernel_size=kernel_size,
+            pool_size=pool_size,
+        )
         forward_fn = forward_cnn
      
 
@@ -896,7 +951,7 @@ def train_model(model_type, data, pos_weight, epochs=60, batch_size=128,
 
     params = [p for layer in models.values() for p in layer.parameters()]
 
-    optimizer = optim.Adam(params, lr=0.0001)
+    optimizer = optim.Adam(params, lr=learning_rate)
     
         # --- DEBUG: print model parameter summary ---
     summarize_model_parameters(models, model_type=model_type)
@@ -1080,10 +1135,20 @@ def load_checkpoint(checkpoint_path, model_type='cnn'):
     model_type = checkpoint.get('model_type', model_type)
     
     if model_type == 'lstm':
-        models = create_lstm_model(input_dim, hidden_dim=hyperparams.get('hidden_dim', 64))
+        models = create_lstm_model(
+            input_dim,
+            hidden_dim=hyperparams.get('hidden_dim', 64),
+        )
         forward_fn = forward_lstm
     else:
-        models = create_cnn_model(input_dim, seq_len)
+        models = create_cnn_model(
+            input_dim,
+            seq_len,
+            n_filters1=hyperparams.get('n_filters1', 128),
+            n_filters2=hyperparams.get('n_filters2', 256),
+            kernel_size=hyperparams.get('kernel_size', 3),
+            pool_size=hyperparams.get('pool_size', 2),
+        )
         forward_fn = forward_cnn
     
     # Load weights
@@ -1885,6 +1950,337 @@ def plot_excitation_inhibition_analysis(initial_weights, final_weights,
     return ei_ratio_final  # Return for use in consistency check
 
 
+def analyze_activation_statistics(
+    models,
+    X_data,
+    channel_names=None,
+    output_folder=None,
+    sample_limit: int = 2000,
+):
+    """
+    Analyze activation statistics for the first convolutional layer (Conv1) of the CNN.
+
+    Computes:
+      - Per-filter stats after BatchNorm + ReLU:
+          * mean, std, max activation
+          * sparsity (% of activations exactly zero)
+          * counts of mostly-dead filters (sparsity >= 90%)
+      - Per-input-channel contribution to Conv1 pre-BN output:
+          * L2 "energy" contribution per channel
+          * mean and std of |activation| per channel
+          * fraction of total activation energy per channel
+
+    Also generates:
+      - Plot 1: Channel activation energy bar chart
+      - Plot 2: Per-channel activation histograms (2x2 grid)
+      - Plot 3: Per-filter activation heatmap (filters x channels)
+      - Plot 4: Filter sparsity bar chart
+      - Plot 5: Per-filter summary stats (mean activation vs sparsity, sorted)
+    """
+    if channel_names is None:
+        channel_names = CHANNEL_NAMES
+
+    if "conv1" not in models:
+        print("analyze_activation_statistics currently supports CNN models (conv1 not found). Skipping.")
+        return
+
+    # Ensure we have a torch tensor [N, T, C]
+    if isinstance(X_data, np.ndarray):
+        X = torch.from_numpy(X_data)
+    else:
+        X = X_data
+
+    if X.ndim != 3:
+        raise ValueError(f"Expected X_data with shape [N, T, C], got {tuple(X.shape)}")
+
+    # Optionally subsample for speed
+    if sample_limit is not None and X.shape[0] > sample_limit:
+        X = X[:sample_limit]
+
+    conv1 = models["conv1"]
+    bn1 = models["bn1"]
+
+    device = next(conv1.parameters()).device
+
+    # Be extra safe: snapshot original training/eval modes and
+    # force eval mode during analysis so BatchNorm running stats
+    # are not updated and dropout (if any) is disabled.
+    conv1_was_training = conv1.training
+    bn1_was_training = bn1.training
+    conv1.eval()
+    bn1.eval()
+
+    with torch.no_grad():
+        X_dev = X.to(device)
+        # Conv1 expects [N, C, T]
+        x_perm = X_dev.permute(0, 2, 1)
+
+        # --- Per-filter stats after BN + ReLU ---
+        z = conv1(x_perm)
+        z_bn = bn1(z)
+        a = F.relu(z_bn)  # [N, F, L]
+
+        a_cpu = a.detach().cpu()
+        n_samples, n_filters, seq_len = a_cpu.shape
+
+        a_flat = a_cpu.reshape(n_samples * seq_len, n_filters)  # [N*T, F]
+
+        mean_per_filter = a_flat.mean(dim=0).numpy()
+        std_per_filter = a_flat.std(dim=0, unbiased=False).numpy()
+        max_per_filter = a_flat.max(dim=0).values.numpy()
+        sparsity_per_filter = (a_flat == 0).float().mean(dim=0).numpy()
+
+        dead_mask = sparsity_per_filter >= 0.90
+        weak_mask = sparsity_per_filter >= 0.70
+
+        n_dead = int(dead_mask.sum())
+        n_weak = int(weak_mask.sum())
+
+        # --- Per-input-channel contributions pre-BN ---
+        weight = conv1.weight.detach()  # [F, C, K]
+        stride = conv1.stride[0]
+        padding = conv1.padding[0]
+        dilation = conv1.dilation[0]
+
+        n_channels = weight.shape[1]
+
+        energy_per_channel = np.zeros(n_channels, dtype=np.float64)
+        mean_abs_per_channel = np.zeros(n_channels, dtype=np.float64)
+        std_abs_per_channel = np.zeros(n_channels, dtype=np.float64)
+        # For heatmap: mean |activation| per (filter, channel)
+        heatmap_per_filter_channel = np.zeros((n_filters, n_channels), dtype=np.float64)
+
+        # Compute contributions channel by channel
+        for ch_idx in range(n_channels):
+            x_c = x_perm[:, ch_idx : ch_idx + 1, :]  # [N, 1, T]
+            w_c = weight[:, ch_idx : ch_idx + 1, :]  # [F, 1, K]
+            contrib = F.conv1d(
+                x_c,
+                w_c,
+                bias=None,
+                stride=stride,
+                padding=padding,
+                dilation=dilation,
+            )  # [N, F, L]
+
+            contrib_abs = contrib.abs()
+
+            # Scalar summaries per channel
+            energy_per_channel[ch_idx] = contrib.pow(2).sum().item()
+            mean_abs_per_channel[ch_idx] = contrib_abs.mean().item()
+            std_abs_per_channel[ch_idx] = contrib_abs.std(unbiased=False).item()
+
+            # Per-filter, per-channel mean |activation|
+            contrib_abs_cpu = contrib_abs.detach().cpu()
+            heatmap_per_filter_channel[:, ch_idx] = (
+                contrib_abs_cpu.mean(dim=(0, 2)).numpy()
+            )  # [F]
+
+        total_energy = float(energy_per_channel.sum() + 1e-8)
+        frac_energy_per_channel = 100.0 * energy_per_channel / total_energy
+
+        # --- Per-channel contributions AFTER BN + ReLU (one-channel-at-a-time) ---
+        post_heatmap_per_filter_channel = np.zeros((n_filters, n_channels), dtype=np.float64)
+
+        for ch_idx in range(n_channels):
+            # Build an input where only channel ch_idx is present
+            X_single = torch.zeros_like(X_dev)
+            X_single[:, :, ch_idx] = X_dev[:, :, ch_idx]
+
+            x_perm_single = X_single.permute(0, 2, 1)  # [N, C, T]
+            z_single = conv1(x_perm_single)
+            z_bn_single = bn1(z_single)
+            a_single = F.relu(z_bn_single)  # [N, F, L]
+
+            # Mean activation per filter for this channel
+            a_single_cpu = a_single.detach().cpu()
+            post_heatmap_per_filter_channel[:, ch_idx] = a_single_cpu.mean(dim=(0, 2)).numpy()
+
+    # Restore original training/eval modes
+    conv1.train(conv1_was_training)
+    bn1.train(bn1_was_training)
+
+    # ============================
+    # Plot 1: Channel energy bar chart
+    # ============================
+    fig1, ax1 = plt.subplots(figsize=(8, 4))
+    y_pos = np.arange(n_channels)
+    ax1.barh(y_pos, frac_energy_per_channel, color="steelblue", alpha=0.8)
+    ax1.set_yticks(y_pos)
+    ax1.set_yticklabels(channel_names)
+    ax1.set_xlabel("Fraction of Conv1 Activation Energy (%)")
+    ax1.set_title("Conv1 Channel Contribution (Pre-BN)")
+    for i, v in enumerate(frac_energy_per_channel):
+        ax1.text(v + 0.5, i, f"{v:5.1f}%", va="center")
+    ax1.grid(True, axis="x", alpha=0.3)
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig1, output_folder, "activation_channel_energy_bar")
+    plt.show()
+
+    # ============================
+    # Plot 2: Per-channel activation histograms (2x2)
+    # ============================
+    fig2, axes2 = plt.subplots(2, 2, figsize=(10, 8))
+    axes2 = axes2.flatten()
+
+    for ch_idx in range(n_channels):
+        x_c = x_perm[:, ch_idx : ch_idx + 1, :]
+        w_c = weight[:, ch_idx : ch_idx + 1, :]
+        contrib = F.conv1d(
+            x_c,
+            w_c,
+            bias=None,
+            stride=stride,
+            padding=padding,
+            dilation=dilation,
+        )
+        vals = contrib.abs().detach().cpu().reshape(-1).numpy()
+        # Optional subsampling for very large arrays
+        if vals.size > 200000:
+            idx = np.random.choice(vals.size, size=200000, replace=False)
+            vals = vals[idx]
+
+        ax = axes2[ch_idx]
+        ax.hist(vals, bins=80, alpha=0.8, color="tab:blue")
+        ax.set_title(f"Channel {ch_idx}: {channel_names[ch_idx]}")
+        ax.set_xlabel("|activation|")
+        ax.set_ylabel("count")
+        ax.grid(True, alpha=0.3)
+
+    # Hide any unused subplots (in case n_channels < 4)
+    for j in range(n_channels, len(axes2)):
+        axes2[j].axis("off")
+
+    plt.suptitle("Conv1 Per-Channel Activation Distributions", fontsize=14)
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig2, output_folder, "activation_per_channel_histograms")
+    plt.show()
+
+    # ============================
+    # Plot 3: Per-filter activation heatmap (pre-BN)
+    # ============================
+    fig3, ax3 = plt.subplots(figsize=(8, 6))
+    im = ax3.imshow(
+        heatmap_per_filter_channel,
+        aspect="auto",
+        cmap="viridis",
+        interpolation="nearest",
+    )
+    ax3.set_xlabel("Input Channel")
+    ax3.set_ylabel("Filter Index")
+    ax3.set_xticks(np.arange(n_channels))
+    ax3.set_xticklabels(channel_names, rotation=45, ha="right")
+    ax3.set_title("Conv1 Mean |Activation| per Filter-Channel")
+    plt.colorbar(im, ax=ax3, shrink=0.7)
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig3, output_folder, "activation_filter_channel_heatmap")
+    plt.show()
+
+    # ============================
+    # EXTRA Plot: Per-filter post-BN+ReLU activation heatmap (one-channel-at-a-time)
+    # ============================
+    fig3b, ax3b = plt.subplots(figsize=(8, 6))
+    im_post = ax3b.imshow(
+        post_heatmap_per_filter_channel,
+        aspect="auto",
+        cmap="viridis",
+        interpolation="nearest",
+    )
+    ax3b.set_xlabel("Input Channel")
+    ax3b.set_ylabel("Filter Index")
+    ax3b.set_xticks(np.arange(n_channels))
+    ax3b.set_xticklabels(channel_names, rotation=45, ha="right")
+    ax3b.set_title("Conv1 Mean Activation per Filter-Channel\n(Post BN+ReLU, One Channel at a Time)")
+    plt.colorbar(im_post, ax=ax3b, shrink=0.7)
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig3b, output_folder, "activation_post_bn_relu_filter_channel_heatmap")
+    plt.show()
+
+    # ============================
+    # Plot 4: Filter sparsity bar chart
+    # ============================
+    fig4, ax4 = plt.subplots(figsize=(10, 4))
+    x_idx = np.arange(n_filters)
+    ax4.bar(x_idx, sparsity_per_filter, color="tab:gray", alpha=0.8)
+    # Highlight mostly-dead filters
+    if n_dead > 0:
+        ax4.bar(
+            x_idx[dead_mask],
+            sparsity_per_filter[dead_mask],
+            color="tab:red",
+            alpha=0.9,
+            label="Dead (>= 90% zero)",
+        )
+    ax4.axhline(0.9, linestyle="--", color="red", alpha=0.6, label="90% sparsity")
+    ax4.set_xlabel("Filter Index")
+    ax4.set_ylabel("Sparsity (fraction of zeros)")
+    ax4.set_title("Conv1 Filter Sparsity")
+    ax4.set_ylim(0.0, 1.0)
+    ax4.grid(True, axis="y", alpha=0.3)
+    ax4.legend()
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig4, output_folder, "activation_filter_sparsity")
+    plt.show()
+
+    # ============================
+    # Plot 5: Per-filter summary stats (sorted by mean activation)
+    # ============================
+    order = np.argsort(-mean_per_filter)  # descending
+    fig5, ax5 = plt.subplots(figsize=(10, 4))
+    ax5.plot(
+        mean_per_filter[order],
+        label="Mean activation",
+        color="tab:blue",
+        linewidth=2,
+    )
+    ax6 = ax5.twinx()
+    ax6.plot(
+        sparsity_per_filter[order],
+        label="Sparsity",
+        color="tab:orange",
+        linewidth=2,
+    )
+    ax5.set_xlabel("Filters (sorted by mean activation)")
+    ax5.set_ylabel("Mean activation")
+    ax6.set_ylabel("Sparsity (fraction of zeros)")
+    ax5.set_title("Conv1 Filter Activity vs Sparsity")
+    ax5.grid(True, axis="y", alpha=0.3)
+    # Build a combined legend
+    lines1, labels1 = ax5.get_legend_handles_labels()
+    lines2, labels2 = ax6.get_legend_handles_labels()
+    ax5.legend(lines1 + lines2, labels1 + labels2, loc="upper right")
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig5, output_folder, "activation_filter_summary")
+    plt.show()
+
+    # ============================
+    # Printed summary
+    # ============================
+    print("\n" + "=" * 80)
+    print("CONV1 ACTIVATION STATISTICS")
+    print("=" * 80)
+    print("Per-channel contributions (pre-BN):")
+    for ch_idx, name in enumerate(channel_names):
+        print(
+            f"  {ch_idx}: {name:12s} | "
+            f"energy_frac={frac_energy_per_channel[ch_idx]:6.2f}%  "
+            f"mean|a|={mean_abs_per_channel[ch_idx]:.4e}  "
+            f"std|a|={std_abs_per_channel[ch_idx]:.4e}"
+        )
+
+    print("\nPer-filter summary after BN + ReLU:")
+    print(f"  Total filters: {n_filters}")
+    print(f"  Dead filters (sparsity >= 90%): {n_dead}")
+    print(f"  Weak filters (sparsity >= 70%): {n_weak}")
+    print("=" * 80 + "\n")
+
+
 def plot_excitation_inhibition_over_epochs(weight_history, output_folder=None, channel_names=None):
     """
     Track excitation and inhibition strength per channel over training epochs.
@@ -2023,8 +2419,13 @@ def channel_ablation_study(models, forward_fn, X_test, y_test, channel_names=Non
     Ablate each channel using appropriate strategy and measure accuracy drop.
     
     Uses ACTUAL TEST DATA (X_test, y_test from your test CSV files).
+    Runs on ALL samples (no filtering) since test data has natural missingness that
+    varies per file. Reports missingness statistics so you know how many samples
+    had the target channel already missing (redundant ablation) or other channels missing.
     
-    NEW: 4-channel architecture [Current, Pressure, Radiation, Prev_A1]
+    For clean ablation metrics, use the robustness suite on validation data instead.
+    
+    4-channel architecture [Current, Pressure, Radiation, Prev_A1]
     Strategy by channel type:
     - Sensors (indices 0, 1, 2): Set to missing_value (-100) to simulate missing sensor
     - Prev_A1 (index 3): Shuffle across samples (preserves distribution)
@@ -2036,10 +2437,9 @@ def channel_ablation_study(models, forward_fn, X_test, y_test, channel_names=Non
         y_test: Test labels tensor [N, 1] - from actual test files
         channel_names: List of channel names
         output_folder: Optional folder to save figure
-        missing_value: Value to use for missing sensor data (default -100)
     
     Returns:
-        results: Dict with ablation results per channel
+        results: Dict with ablation results per channel (includes missingness stats for sensors)
     """
     missing_value = -100.0  # Default missing value
     
@@ -2050,84 +2450,180 @@ def channel_ablation_study(models, forward_fn, X_test, y_test, channel_names=Non
     for layer in models.values():
         layer.eval()
     
-    # Compute baseline accuracy
+    n_total = X_test.shape[0]
+    
+    # Compute baseline accuracy over all samples
     with torch.no_grad():
-        logits = forward_fn(models, X_test)
-        preds = (logits > 0).float()
-        baseline_acc = (preds == y_test).float().mean().item()
+        baseline_logits = forward_fn(models, X_test)
+        baseline_preds = (baseline_logits > 0).float()
+        baseline_acc = (baseline_preds == y_test).float().mean().item()
     
     # Channel index mapping (4 channels):
     # 0: Current, 1: Pressure, 2: Radiation, 3: Prev_A1
-    sensor_channels = [0, 1, 2]  # Channels that can be set to missing_value
+    sensor_channels = [0, 1, 2]
+    
+    # Detect pre-existing missing data per sample per sensor channel
+    missing_mask = get_missing_mask(X_test, missing_value=missing_value)  # [N, 3] bool
     
     results = {}
     accuracy_drops = []
     
-    print("\n" + "="*85)
-    print("CHANNEL ABLATION STUDY (using actual test data)")
-    print("="*85)
-    print(f"Test samples: {X_test.shape[0]} | Baseline Accuracy: {baseline_acc:.4f}")
-    print("-"*85)
-    print(f"{'Channel':<16} | {'Method':<20} | {'Ablated Acc':>12} | {'Drop':>10} | {'Importance':<12}")
-    print("-"*85)
+    print("\n" + "="*120)
+    print("CHANNEL ABLATION STUDY (test data -- all samples, with missingness reporting)")
+    print("="*120)
+    print(f"Total test samples: {n_total} | Overall Baseline Accuracy: {baseline_acc:.4f}")
+    print("\nPre-existing missingness in test data:")
+    for s_idx, s_name in enumerate(['Current', 'Pressure', 'Radiation']):
+        n_missing = missing_mask[:, s_idx].sum().item()
+        pct = 100.0 * n_missing / n_total if n_total > 0 else 0
+        print(f"  {s_name}: {int(n_missing)}/{n_total} samples already missing ({pct:.1f}%)")
+    
+    any_missing = missing_mask.any(dim=1).sum().item()
+    all_clean = n_total - any_missing
+    print(f"  Fully clean (no sensor missing): {all_clean}/{n_total} ({100.0*all_clean/n_total:.1f}%)")
+    
+    print("-"*120)
+    print(f"{'Channel':<16} | {'Method':<12} | {'Ablated Acc':>11} | {'Drop':>8} | {'Importance':<10} | {'N_total':>7} | {'N_tgt_miss':>10} | {'N_oth_miss':>10} | {'N_clean':>7}")
+    print("-"*120)
     
     for ch_idx, ch_name in enumerate(channel_names):
         X_ablated = X_test.clone()
         
         if ch_idx in sensor_channels:
-            # Sensor channel: Set to missing_value to simulate missing sensor
             X_ablated[:, :, ch_idx] = missing_value
             method = f'set_{missing_value}'
+            
+            # Missingness stats (informational, not used for filtering)
+            target_already_missing = missing_mask[:, ch_idx]
+            other_chs = [j for j in range(3) if j != ch_idx]
+            other_missing = missing_mask[:, other_chs].any(dim=1)
+            
+            n_target_miss = int(target_already_missing.sum().item())
+            n_other_miss = int(other_missing.sum().item())
+            n_clean = int((~target_already_missing & ~other_missing).sum().item())
+            
+            with torch.no_grad():
+                logits = forward_fn(models, X_ablated)
+                preds = (logits > 0).float()
+                ablated_acc = (preds == y_test).float().mean().item()
+            
+            drop = baseline_acc - ablated_acc
+            accuracy_drops.append(drop)
+            
+            if drop > 0.05:
+                importance = "HIGH"
+            elif drop > 0.01:
+                importance = "MEDIUM"
+            elif drop > 0:
+                importance = "LOW"
+            else:
+                importance = "NONE/NEG"
+            
+            print(f"{ch_name:<16} | {method:<12} | {ablated_acc:>11.4f} | {drop:>+8.4f} | {importance:<10} | {n_total:>7} | {n_target_miss:>10} | {n_other_miss:>10} | {n_clean:>7}")
+            
+            results[ch_name] = {
+                'baseline': baseline_acc,
+                'ablated': ablated_acc,
+                'drop': drop,
+                'method': method,
+                'importance': importance,
+                'n_total': n_total,
+                'n_target_already_missing': n_target_miss,
+                'n_other_missing': n_other_miss,
+                'n_fully_clean': n_clean,
+            }
+        
         elif ch_idx == 3:
             # Prev_A1: Shuffle across samples (preserves distribution)
             n_samples = X_ablated.shape[0]
             perm = torch.randperm(n_samples)
             X_ablated[:, :, ch_idx] = X_ablated[perm, :, ch_idx]
             method = 'shuffle'
+            
+            with torch.no_grad():
+                logits = forward_fn(models, X_ablated)
+                preds = (logits > 0).float()
+                ablated_acc = (preds == y_test).float().mean().item()
+            
+            drop = baseline_acc - ablated_acc
+            accuracy_drops.append(drop)
+            
+            if drop > 0.05:
+                importance = "HIGH"
+            elif drop > 0.01:
+                importance = "MEDIUM"
+            elif drop > 0:
+                importance = "LOW"
+            else:
+                importance = "NONE/NEG"
+            
+            print(f"{ch_name:<16} | {method:<12} | {ablated_acc:>11.4f} | {drop:>+8.4f} | {importance:<10} | {n_total:>7} | {'N/A':>10} | {'N/A':>10} | {'N/A':>7}")
+            
+            results[ch_name] = {
+                'baseline': baseline_acc,
+                'ablated': ablated_acc,
+                'drop': drop,
+                'method': method,
+                'importance': importance,
+                'n_total': n_total,
+                'n_target_already_missing': 0,
+                'n_other_missing': 0,
+                'n_fully_clean': n_total,
+            }
+        
         else:
             # Fallback
             X_ablated[:, :, ch_idx] = missing_value
             method = f'set_{missing_value}'
-        
-        with torch.no_grad():
-            logits = forward_fn(models, X_ablated)
-            preds = (logits > 0).float()
-            ablated_acc = (preds == y_test).float().mean().item()
-        
-        drop = baseline_acc - ablated_acc
-        accuracy_drops.append(drop)
-        
-        # Determine importance level
-        if drop > 0.05:
-            importance = "HIGH"
-        elif drop > 0.01:
-            importance = "MEDIUM"
-        elif drop > 0:
-            importance = "LOW"
-        else:
-            importance = "NONE/NEG"
-        
-        results[ch_name] = {
-            'baseline': baseline_acc,
-            'ablated': ablated_acc,
-            'drop': drop,
-            'method': method,
-            'importance': importance
-        }
-        
-        print(f"{ch_name:<16} | {method:<20} | {ablated_acc:>12.4f} | {drop:>+10.4f} | {importance:<12}")
+            
+            with torch.no_grad():
+                logits = forward_fn(models, X_ablated)
+                preds = (logits > 0).float()
+                ablated_acc = (preds == y_test).float().mean().item()
+            
+            drop = baseline_acc - ablated_acc
+            accuracy_drops.append(drop)
+            importance = "HIGH" if drop > 0.05 else "MEDIUM" if drop > 0.01 else "LOW" if drop > 0 else "NONE/NEG"
+            
+            print(f"{ch_name:<16} | {method:<12} | {ablated_acc:>11.4f} | {drop:>+8.4f} | {importance:<10} | {n_total:>7} | {'N/A':>10} | {'N/A':>10} | {'N/A':>7}")
+            
+            results[ch_name] = {
+                'baseline': baseline_acc,
+                'ablated': ablated_acc,
+                'drop': drop,
+                'method': method,
+                'importance': importance,
+                'n_total': n_total,
+                'n_target_already_missing': 0,
+                'n_other_missing': 0,
+                'n_fully_clean': n_total,
+            }
     
-    print("="*85)
-    print("Note: Sensors set to 0 with mask=0 (missing), Prev_A1 shuffled across samples")
-    print("="*85)
+    print("="*120)
+    print("Note: Test data ablation uses ALL samples. Missingness columns are informational:")
+    print("      N_tgt_miss = target channel was already -100 (ablation redundant for those samples)")
+    print("      N_oth_miss = another sensor channel was already -100")
+    print("      N_clean = samples where neither target nor other sensors were pre-missing")
+    print("      For clean ablation metrics, see the VALIDATION robustness report.")
+    print("="*120)
     
     # --- Plot ablation results ---
-    fig, ax = plt.subplots(figsize=(12, 6))
+    fig, ax = plt.subplots(figsize=(14, 6))
     
     x = np.arange(len(channel_names))
     colors = ['green' if d > 0.05 else 'orange' if d > 0.01 else 'gray' for d in accuracy_drops]
     
     bars = ax.bar(x, accuracy_drops, color=colors, alpha=0.8, edgecolor='black')
+    
+    # Annotate bars with missingness info for sensor channels
+    for i, (bar, ch_name) in enumerate(zip(bars, channel_names)):
+        r = results[ch_name]
+        n_tgt = r.get('n_target_already_missing', 0)
+        ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.002,
+                f'n={r["n_total"]}', ha='center', va='bottom', fontsize=9, fontweight='bold')
+        if n_tgt > 0:
+            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.012,
+                    f'({n_tgt} already missing)', ha='center', va='bottom', fontsize=7, color='red')
     
     ax.axhline(y=0, color='black', linewidth=0.5)
     ax.axhline(y=0.05, color='red', linestyle='--', linewidth=1, alpha=0.5, label='High importance threshold (5%)')
@@ -2135,7 +2631,7 @@ def channel_ablation_study(models, forward_fn, X_test, y_test, channel_names=Non
     
     ax.set_xlabel('Input Channel', fontsize=12)
     ax.set_ylabel('Accuracy Drop (Baseline - Ablated)', fontsize=12)
-    ax.set_title('Channel Ablation Study: Accuracy Drop per Channel\n(Higher = More Important)', fontsize=14)
+    ax.set_title('Channel Ablation Study: Accuracy Drop per Channel (Test Data, All Samples)\n(Higher = More Important | Red annotation = samples where target was already missing)', fontsize=13)
     ax.set_xticks(x)
     ax.set_xticklabels(channel_names, rotation=45, ha='right')
     ax.legend()
@@ -3293,6 +3789,8 @@ def test_single_file_simulation(filepath, models, forward_fn, scaler, sequence_l
 def create_ablations(X_data, y_data, missing_value=-100.0, random_seed=42):
     """
     Creates deterministic ablation variants of input data (validation or test).
+    Also returns a missing_mask indicating which samples already have pre-existing
+    missing sensor data, so downstream evaluation can filter appropriately.
     
     Args:
         X_data: Input tensor [N, seq_len, 4] - channels: [Current, Pressure, Radiation, Prev_A1]
@@ -3300,18 +3798,21 @@ def create_ablations(X_data, y_data, missing_value=-100.0, random_seed=42):
         missing_value: Value to use for missing sensor data (default -100)
         random_seed: Seed for reproducible shuffling (uses LOCAL generator, doesn't affect global state)
     
-    Returns dict with keys:
-    
-    Sensor ablations (channels 0, 1, 2):
-    - 'clean': Original data
-    - '{sensor}_full': Sensor channel fully missing (-100)
-    - '{sensor}_block': Sensor channel 50% block missing (middle)
-    
-    Prev_A1 ablations (channel 3 - binary 0/1):
-    - 'prev_a1_shuffle': Shuffled across samples (breaks correlation, preserves distribution)
-    - 'prev_a1_const_0': All zeros (what if previous was always "stable"?)
-    - 'prev_a1_const_1': All ones (what if previous was always "increase"?)
-    - 'prev_a1_flip': Flipped values 0→1, 1→0 (tests polarity understanding)
+    Returns:
+        ablations: Dict with keys:
+            Sensor ablations (channels 0, 1, 2):
+            - 'clean': Original data
+            - '{sensor}_full': Sensor channel fully missing (-100)
+            - '{sensor}_block': Sensor channel 50% block missing (middle)
+            
+            Prev_A1 ablations (channel 3 - binary 0/1):
+            - 'prev_a1_shuffle': Shuffled across samples
+            - 'prev_a1_const_0': All zeros
+            - 'prev_a1_const_1': All ones
+            - 'prev_a1_flip': Flipped values 0->1, 1->0
+        
+        missing_mask: Boolean tensor [N, 3] where mask[i, ch] = True if sample i
+                      already has missing data in sensor channel ch (0=Current, 1=Pressure, 2=Radiation).
     """
     # Use LOCAL generator to avoid affecting global torch random state
     # (doesn't interfere with model weight initialization or training)
@@ -3321,6 +3822,9 @@ def create_ablations(X_data, y_data, missing_value=-100.0, random_seed=42):
     n_samples = X_data.shape[0]
     block_start = seq_len // 4
     block_end = 3 * seq_len // 4  # 50% middle block
+    
+    # Detect pre-existing missing data BEFORE creating ablation variants
+    missing_mask = get_missing_mask(X_data, missing_value=missing_value)
     
     ablations = {'clean': (X_data.clone(), y_data.clone())}
     
@@ -3362,13 +3866,16 @@ def create_ablations(X_data, y_data, missing_value=-100.0, random_seed=42):
     X_flip[:, :, prev_a1_idx] = 1.0 - X_data[:, :, prev_a1_idx]
     ablations['prev_a1_flip'] = (X_flip, y_data.clone())
     
-    return ablations
+    return ablations, missing_mask
 
 
 def create_validation_ablations(X_val, y_val, missing_value=-100.0):
     """
     Creates deterministic ablation variants of validation data.
     Wrapper around create_ablations for backward compatibility.
+    
+    Returns:
+        (ablations, missing_mask)
     """
     return create_ablations(X_val, y_val, missing_value=missing_value, random_seed=42)
 
@@ -3377,19 +3884,58 @@ def create_test_ablations(X_test, y_test, missing_value=-100.0):
     """
     Creates deterministic ablation variants of test data.
     Uses different seed than validation for independence.
+    
+    Returns:
+        (ablations, missing_mask)
     """
     return create_ablations(X_test, y_test, missing_value=missing_value, random_seed=97)
 
 
-def evaluate_robustness(models, forward_fn, ablations, device='cpu'):
+def evaluate_robustness(models, forward_fn, ablations, missing_mask=None, 
+                        filter_missing=True, device='cpu'):
     """
     Evaluates model on all ablation variants.
     
-    Returns dict of {ablation_name: {'accuracy': float, 'precision': float, 'recall': float}}
+    Two modes controlled by filter_missing:
+    
+    filter_missing=True (use for VALIDATION data):
+        For sensor ablation variants, excludes samples where the target channel
+        is already missing OR any other sensor channel is already missing.
+        Reports clean-subset metrics as primary, multi-missing separately.
+    
+    filter_missing=False (use for TEST data with natural missingness):
+        Evaluates ALL samples. Still reports missingness stats for information.
+    
+    Prev_A1 ablations and 'clean' always use ALL samples regardless of filter_missing.
+    
+    Args:
+        models: Dict of model layers
+        forward_fn: Forward function
+        ablations: Dict of {name: (X, y)} ablation variants
+        missing_mask: Optional [N, 3] bool tensor from get_missing_mask / create_ablations.
+                      If None, all samples are used (backward compatible).
+        filter_missing: If True, filter sensor ablations to clean subset.
+                        If False, use all samples but report stats.
+        device: Device to evaluate on
+    
+    Returns:
+        dict of {ablation_name: {
+            'accuracy': float,
+            'precision': float,
+            'recall': float,
+            'n_clean': int,
+            'n_multi_missing': int,
+            'multi_missing_acc': float or None
+        }}
     """
+    sensor_ablation_map = {
+        'current': 0,
+        'pressure': 1,
+        'radiation': 2,
+    }
+    
     results = {}
     
-    # Set eval mode
     for layer in models.values():
         layer.eval()
     
@@ -3401,23 +3947,82 @@ def evaluate_robustness(models, forward_fn, ablations, device='cpu'):
             
             preds_np = preds.squeeze().cpu().numpy()
             y_np = y.squeeze().cpu().numpy()
+        
+        # Determine if this is a sensor ablation
+        ablated_ch = None
+        if missing_mask is not None:
+            for prefix, ch_idx in sensor_ablation_map.items():
+                if name.startswith(prefix):
+                    ablated_ch = ch_idx
+                    break
+        
+        if ablated_ch is not None and missing_mask is not None:
+            # Compute clean mask: exclude target-already-missing AND other-missing
+            target_missing = missing_mask[:, ablated_ch].cpu().numpy()
+            other_chs = [j for j in range(3) if j != ablated_ch]
+            other_missing = missing_mask[:, other_chs].any(dim=1).cpu().numpy()
+            any_issue = target_missing | other_missing
+            clean_idx = ~any_issue
             
+            n_clean = int(clean_idx.sum())
+            n_excluded = int(any_issue.sum())
+            
+            if filter_missing and n_clean > 0:
+                # VALIDATION MODE: use clean subset only
+                acc = (preds_np[clean_idx] == y_np[clean_idx]).mean()
+                prec = precision_score(y_np[clean_idx], preds_np[clean_idx], zero_division=0)
+                rec = recall_score(y_np[clean_idx], preds_np[clean_idx], zero_division=0)
+                
+                if n_excluded > 0:
+                    multi_acc = (preds_np[any_issue] == y_np[any_issue]).mean()
+                else:
+                    multi_acc = None
+            elif filter_missing and n_clean == 0:
+                acc, prec, rec = 0.0, 0.0, 0.0
+                multi_acc = (preds_np == y_np).mean()
+            else:
+                # TEST MODE: use ALL samples, just report stats
+                acc = (preds_np == y_np).mean()
+                prec = precision_score(y_np, preds_np, zero_division=0)
+                rec = recall_score(y_np, preds_np, zero_division=0)
+                
+                if n_excluded > 0:
+                    multi_acc = (preds_np[any_issue] == y_np[any_issue]).mean()
+                else:
+                    multi_acc = None
+            
+            results[name] = {
+                'accuracy': acc, 'precision': prec, 'recall': rec,
+                'n_clean': n_clean, 'n_multi_missing': n_excluded,
+                'multi_missing_acc': multi_acc
+            }
+        else:
+            # 'clean' variant, prev_a1 ablations, or no mask: use ALL samples
+            n_total = len(y_np)
             acc = (preds_np == y_np).mean()
             prec = precision_score(y_np, preds_np, zero_division=0)
             rec = recall_score(y_np, preds_np, zero_division=0)
             
-        results[name] = {'accuracy': acc, 'precision': prec, 'recall': rec}
+            results[name] = {
+                'accuracy': acc, 'precision': prec, 'recall': rec,
+                'n_clean': n_total, 'n_multi_missing': 0,
+                'multi_missing_acc': None
+            }
+    
     return results
 
 
 def _write_robustness_section(f, robustness_results, section_title):
-    """Helper to write robustness metrics for a single dataset (val or test)."""
-    f.write("=" * 90 + "\n")
-    f.write(f"{section_title}\n")
-    f.write("=" * 90 + "\n\n")
+    """Helper to write robustness metrics for a single dataset (val or test).
     
-    f.write(f"{'Ablation Type':<20} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'Acc Delta':>12}\n")
-    f.write("-" * 62 + "\n")
+    Now includes missing-aware columns: N_clean, N_multi, Multi_Acc for sensor ablations.
+    """
+    f.write("=" * 120 + "\n")
+    f.write(f"{section_title}\n")
+    f.write("=" * 120 + "\n\n")
+    
+    f.write(f"{'Ablation Type':<20} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'Acc Delta':>12} {'N_clean':>8} {'N_multi':>8} {'Multi_Acc':>10}\n")
+    f.write("-" * 100 + "\n")
     
     clean_acc = robustness_results.get('clean', {}).get('accuracy', 0)
     
@@ -3427,23 +4032,32 @@ def _write_robustness_section(f, robustness_results, section_title):
         rec = metrics['recall']
         delta = acc - clean_acc if name != 'clean' else 0.0
         delta_str = f"{delta:+.4f}" if name != 'clean' else "---"
-        f.write(f"{name:<20} {acc:>10.4f} {prec:>10.4f} {rec:>10.4f} {delta_str:>12}\n")
+        
+        n_clean = metrics.get('n_clean', '---')
+        n_multi = metrics.get('n_multi_missing', 0)
+        multi_acc = metrics.get('multi_missing_acc', None)
+        
+        n_clean_str = f"{n_clean:>8}" if isinstance(n_clean, int) else f"{'---':>8}"
+        n_multi_str = f"{n_multi:>8}" if n_multi > 0 else f"{'---':>8}"
+        multi_acc_str = f"{multi_acc:>10.4f}" if multi_acc is not None else f"{'N/A':>10}"
+        
+        f.write(f"{name:<20} {acc:>10.4f} {prec:>10.4f} {rec:>10.4f} {delta_str:>12} {n_clean_str} {n_multi_str} {multi_acc_str}\n")
     
-    f.write("\n" + "-" * 62 + "\n")
+    f.write("\n" + "-" * 100 + "\n")
     f.write("SUMMARY STATISTICS\n")
-    f.write("-" * 62 + "\n")
+    f.write("-" * 100 + "\n")
     
     clean = robustness_results.get('clean', {})
     f.write(f"Clean Baseline:  Acc={clean.get('accuracy', 0):.4f}  "
             f"Prec={clean.get('precision', 0):.4f}  Rec={clean.get('recall', 0):.4f}\n\n")
     
-    # Sensor full-missing averages
+    # Sensor full-missing averages (using clean-subset metrics)
     full_metrics = {k: v for k, v in robustness_results.items() if '_full' in k}
     if full_metrics:
         avg_acc = np.mean([v['accuracy'] for v in full_metrics.values()])
         avg_prec = np.mean([v['precision'] for v in full_metrics.values()])
         avg_rec = np.mean([v['recall'] for v in full_metrics.values()])
-        f.write(f"Sensor Full-Missing Avg:  Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
+        f.write(f"Sensor Full-Missing Avg (clean subset):  Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
     
     # Sensor block-missing averages
     block_metrics = {k: v for k, v in robustness_results.items() if '_block' in k}
@@ -3451,17 +4065,74 @@ def _write_robustness_section(f, robustness_results, section_title):
         avg_acc = np.mean([v['accuracy'] for v in block_metrics.values()])
         avg_prec = np.mean([v['precision'] for v in block_metrics.values()])
         avg_rec = np.mean([v['recall'] for v in block_metrics.values()])
-        f.write(f"Sensor Block-Missing Avg: Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
+        f.write(f"Sensor Block-Missing Avg (clean subset): Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
     
-    # Prev_A1 ablation averages
+    # Prev_A1 ablation averages (all samples, not filtered)
     prev_a1_metrics = {k: v for k, v in robustness_results.items() if 'prev_a1' in k}
     if prev_a1_metrics:
         avg_acc = np.mean([v['accuracy'] for v in prev_a1_metrics.values()])
         avg_prec = np.mean([v['precision'] for v in prev_a1_metrics.values()])
         avg_rec = np.mean([v['recall'] for v in prev_a1_metrics.values()])
-        f.write(f"Prev_A1 Ablation Avg:     Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
+        f.write(f"Prev_A1 Ablation Avg (all samples):      Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
     
+    f.write("\nNote: Sensor ablation metrics computed on CLEAN subset only (no other sensor pre-missing).\n")
+    f.write("      Prev_A1 ablations use ALL samples. Multi_Acc shows accuracy on excluded samples.\n")
     f.write("\n")
+
+
+def plot_robustness_ablation(robustness_results, title_suffix="", output_folder=None, filename=None):
+    """
+    Bar chart of accuracy drop per ablation variant from the robustness suite.
+    
+    Shows drop = clean_accuracy - ablated_accuracy for each variant.
+    Annotates sensor ablation bars with clean sample count if available.
+    
+    Args:
+        robustness_results: Dict from evaluate_robustness()
+        title_suffix: String appended to chart title (e.g., "Validation" or "Test")
+        output_folder: Optional folder to save figure
+        filename: Optional filename for saved figure
+    """
+    clean_acc = robustness_results.get('clean', {}).get('accuracy', 0)
+    
+    # Exclude 'clean' from the bar chart (it's the baseline)
+    ablation_names = [n for n in robustness_results if n != 'clean']
+    drops = [clean_acc - robustness_results[n]['accuracy'] for n in ablation_names]
+    n_cleans = [robustness_results[n].get('n_clean', None) for n in ablation_names]
+    n_excluded = [robustness_results[n].get('n_multi_missing', 0) for n in ablation_names]
+    
+    fig, ax = plt.subplots(figsize=(14, 6))
+    
+    x = np.arange(len(ablation_names))
+    colors = ['green' if d > 0.05 else 'orange' if d > 0.01 else 'gray' for d in drops]
+    
+    bars = ax.bar(x, drops, color=colors, alpha=0.8, edgecolor='black')
+    
+    for i, (bar, nc, ne) in enumerate(zip(bars, n_cleans, n_excluded)):
+        if nc is not None:
+            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.002,
+                    f'n={nc}', ha='center', va='bottom', fontsize=8, fontweight='bold')
+        if ne and ne > 0:
+            ax.text(bar.get_x() + bar.get_width()/2., bar.get_height() + 0.012,
+                    f'(excl {ne})', ha='center', va='bottom', fontsize=7, color='red')
+    
+    ax.axhline(y=0, color='black', linewidth=0.5)
+    ax.axhline(y=0.05, color='red', linestyle='--', linewidth=1, alpha=0.5, label='High importance (5%)')
+    ax.axhline(y=0.01, color='orange', linestyle='--', linewidth=1, alpha=0.5, label='Medium importance (1%)')
+    
+    ax.set_xlabel('Ablation Variant', fontsize=12)
+    ax.set_ylabel('Accuracy Drop (Clean - Ablated)', fontsize=12)
+    ax.set_title(f'Robustness Ablation: Accuracy Drop per Variant ({title_suffix})\n'
+                 f'Baseline (clean) Acc = {clean_acc:.4f}', fontsize=13)
+    ax.set_xticks(x)
+    ax.set_xticklabels(ablation_names, rotation=45, ha='right', fontsize=9)
+    ax.legend()
+    ax.grid(True, alpha=0.3)
+    
+    plt.tight_layout()
+    if output_folder and filename:
+        save_figure(fig, output_folder, filename)
+    plt.show()
 
 
 def save_robustness_report(robustness_results, validation_checks, output_folder, 
@@ -3709,10 +4380,10 @@ if __name__ == "__main__":
     
     # UPDATE YOUR PATHS HERE
     TRAIN_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\training" 
-    #TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\testing"
+    TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\testing"
     
     ##Noisy test data. For model validation.
-    TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\Data For Model\Test Data"  #
+    #TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\Data For Model\Test Data"  #
 
     # TRAIN_DIR = r"C:\Users\skantamne\Downloads\PhD EGun\Data\Archive 2\gun_conditioning_spike_cleaned\v8 spikes cleaned until max\training" 
     # TEST_DIR = r"C:\Users\skantamne\Downloads\PhD EGun\Data\Archive 2\gun_conditioning_spike_cleaned\v8 spikes cleaned until max\testing"
@@ -3769,6 +4440,12 @@ if __name__ == "__main__":
         MODEL_TYPE, data, pos_weight, 
         epochs=HYPERPARAMS['epochs'], 
         batch_size=HYPERPARAMS['batch_size'],
+        learning_rate=HYPERPARAMS['learning_rate'],
+        n_filters1=HYPERPARAMS['n_filters1'],
+        n_filters2=HYPERPARAMS['n_filters2'],
+        kernel_size=HYPERPARAMS['kernel_size'],
+        pool_size=HYPERPARAMS['pool_size'],
+        hidden_dim=HYPERPARAMS['hidden_dim'],
         prob_full_missing=HYPERPARAMS['prob_full_missing'],
         prob_block_missing=HYPERPARAMS['prob_block_missing'],
         min_block_pct=HYPERPARAMS['dropout_min_block_pct'],
@@ -3784,19 +4461,19 @@ if __name__ == "__main__":
     
     # --- VALIDATION SET ABLATIONS ---
     print("\n--- Validation Set Ablations ---")
-    val_ablations = create_validation_ablations(
+    val_ablations, val_missing_mask = create_validation_ablations(
         data['X_val'], data['y_val'], 
         missing_value=HYPERPARAMS['missing_value']
     )
-    val_robustness = evaluate_robustness(models, fwd_fn, val_ablations)
+    val_robustness = evaluate_robustness(models, fwd_fn, val_ablations, missing_mask=val_missing_mask, filter_missing=True)
     
     # --- TEST SET ABLATIONS ---
     print("\n--- Test Set Ablations ---")
-    test_ablations = create_test_ablations(
+    test_ablations, test_missing_mask = create_test_ablations(
         data['X_test'], data['y_test'], 
         missing_value=HYPERPARAMS['missing_value']
     )
-    test_robustness = evaluate_robustness(models, fwd_fn, test_ablations)
+    test_robustness = evaluate_robustness(models, fwd_fn, test_ablations, missing_mask=test_missing_mask, filter_missing=False)
     
     # Run validation checks
     validation_checks = run_validation_checks(
@@ -3805,6 +4482,12 @@ if __name__ == "__main__":
         model_type=MODEL_TYPE,
         missing_value=HYPERPARAMS['missing_value']
     )
+    
+    # Plot robustness ablation results
+    plot_robustness_ablation(val_robustness, title_suffix="Validation - Clean Subset",
+                            output_folder=OUTPUT_FOLDER, filename="robustness_ablation_val")
+    plot_robustness_ablation(test_robustness, title_suffix="Test - All Samples",
+                            output_folder=OUTPUT_FOLDER, filename="robustness_ablation_test")
     
     # Save comprehensive robustness report (includes both val and test)
     save_robustness_report(val_robustness, validation_checks, OUTPUT_FOLDER, 
@@ -3828,7 +4511,20 @@ if __name__ == "__main__":
         output_folder=OUTPUT_FOLDER,
         channel_names=CHANNEL_NAMES
     )
-    
+
+    # ==========================================
+    # 4.5 ACTIVATION STATISTICS (Conv1)
+    # ==========================================
+    print("\n>>> Analyzing Activation Statistics...")
+    if MODEL_TYPE == 'cnn':
+        analyze_activation_statistics(
+            models,
+            data['X_val'],
+            channel_names=CHANNEL_NAMES,
+            output_folder=OUTPUT_FOLDER,
+        )
+    else:
+        print("Activation statistics are currently implemented for the CNN model only. Skipping for LSTM.")
     # ==========================================
     # 4.1 NEW: EXCITATION/INHIBITION ANALYSIS
     # ==========================================
