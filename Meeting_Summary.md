@@ -1,4 +1,5 @@
-Meeting - 03/04/2026 - Erdong and Sai (In-person)
+### **Meeting - 03/03/2026 - Erdong and Sai (In-person)**
+
 **PROGRESS**
 
 **Tested single-channel importance by:**
