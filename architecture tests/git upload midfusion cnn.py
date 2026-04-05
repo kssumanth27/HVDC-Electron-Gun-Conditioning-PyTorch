@@ -26,7 +26,9 @@ import matplotlib.pyplot as plt
 import glob
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, ConfusionMatrixDisplay
+from sklearn.metrics import (confusion_matrix, precision_score, recall_score,
+                             ConfusionMatrixDisplay, precision_recall_curve,
+                             average_precision_score)
 
 from mpl_toolkits.mplot3d import Axes3D  # needed for 3D plots
 import copy
@@ -183,6 +185,50 @@ def save_text_report(output_folder, filename, content):
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
     print(f"Saved: {filepath}")
+
+
+def save_test_probability_report(output_folder, models, forward_fn, data,
+                                 test_ablations=None, threshold=0.5):
+    """
+    Save per-sample probabilities for the clean test set and optional test ablations.
+
+    The report includes one row per sample:
+      sample index | true label | predicted probability | hard prediction
+    """
+    first_model = next(iter(models.values()))
+    device = next(first_model.parameters()).device
+    sections = []
+
+    def _append_section(section_name, X, y):
+        X = X.to(device)
+        y = y.to(device)
+        with torch.inference_mode():
+            logits = forward_fn(models, X)
+            probs = torch.sigmoid(logits).detach().cpu().numpy().ravel()
+            y_true = y.detach().cpu().numpy().ravel()
+            preds = (probs >= threshold).astype(int)
+
+        header = [
+            "=" * 90,
+            f"{section_name}",
+            "=" * 90,
+            f"Threshold: {threshold:.4f}",
+            f"Samples: {len(y_true)}",
+            "sample_idx\ttrue_label\tpred_probability\tpred_class",
+        ]
+        rows = [
+            f"{idx}\t{int(y_val)}\t{prob:.8f}\t{int(pred)}"
+            for idx, (y_val, prob, pred) in enumerate(zip(y_true, probs, preds))
+        ]
+        sections.append("\n".join(header + rows))
+
+    _append_section("TEST SET - CLEAN", data['X_test'], data['y_test'])
+
+    if test_ablations:
+        for ablation_name, (X_ab, y_ab) in test_ablations.items():
+            _append_section(f"TEST ABLATION - {ablation_name}", X_ab, y_ab)
+
+    save_text_report(output_folder, "test_probabilities", "\n\n".join(sections) + "\n")
 
 
 # ==========================================
@@ -936,7 +982,7 @@ def prepare_all_data(train_folder, test_folder, sequence_length,
         X_train_all, y_train_all, 
         test_size=0.15, 
         shuffle=True, 
-        random_state=97
+        random_state=524
     )
     
     # --- PROCESS TEST SEQUENCES ---
@@ -1030,6 +1076,8 @@ def create_cnn_model(
     pool_size: int = 2,
     fusion_channels: int = None,
     cnn_architecture: str = "mid_fusion_pointwise",
+    branch2_filters: int = 128,
+    fc_hidden: int = 500,
 ):
     """
     WHAT: Defines the Neural Network structure.
@@ -1084,25 +1132,56 @@ def create_cnn_model(
         bn_fuse = None
         conv2 = nn.Conv1d(n_filters1, n_filters2, kernel_size=kernel_size, padding=kernel_size // 2)
         bn2 = nn.BatchNorm1d(n_filters2)
+
+    elif cnn_architecture == "split_fusion_3plus1":
+        if input_dim != 4:
+            raise ValueError(
+                f"split_fusion_3plus1 requires exactly 4 input channels, got {input_dim}"
+            )
+        print("yes split_fusion_3plus1")
+        pad = kernel_size // 2
+
+        # Branch A — fused 3 sensors (channels 0-2)
+        conv1_three = nn.Conv1d(3, n_filters1, kernel_size=kernel_size, padding=pad)
+        bn1_three   = nn.BatchNorm1d(n_filters1)
+        conv2_three = nn.Conv1d(n_filters1, branch2_filters, kernel_size=kernel_size, padding=pad)
+        bn2_three   = nn.BatchNorm1d(branch2_filters)
+
+        # Branch B — 4th channel alone
+        conv1_one = nn.Conv1d(1, n_filters1, kernel_size=kernel_size, padding=pad)
+        bn1_one   = nn.BatchNorm1d(n_filters1)
+        conv2_one = nn.Conv1d(n_filters1, branch2_filters, kernel_size=kernel_size, padding=pad)
+        bn2_one   = nn.BatchNorm1d(branch2_filters)
+
+        # Merge: conv on concatenated branches (branch2_filters * 2 -> n_filters2)
+        conv3 = nn.Conv1d(branch2_filters * 2, n_filters2, kernel_size=kernel_size, padding=pad)
+        bn3   = nn.BatchNorm1d(n_filters2)
+
+        # No pooling — time length stays seq_len throughout.
+        flatten_size = n_filters2 * seq_len
+        linear1 = nn.Linear(flatten_size, fc_hidden)
+        linear2 = nn.Linear(fc_hidden, 1)
+
+        return {
+            'conv1_three': conv1_three, 'bn1_three': bn1_three,
+            'conv2_three': conv2_three, 'bn2_three': bn2_three,
+            'conv1_one': conv1_one,     'bn1_one': bn1_one,
+            'conv2_one': conv2_one,     'bn2_one': bn2_one,
+            'conv3': conv3,             'bn3': bn3,
+            'linear1': linear1,         'linear2': linear2,
+        }
+
     else:
         raise ValueError(f"Unknown cnn_architecture={cnn_architecture!r}")
     
-    # Pooling: Shrinks time dimension by half (Downsampling)
+    # --- Pooling + linear for mid_fusion_pointwise / early_fusion only ---
     pool = nn.MaxPool1d(kernel_size=pool_size, stride=pool_size)
     
-    # --- LINEAR LAYER SIZING MATH ---
-    # Logic: We must calculate exactly how many neurons are left after flattening.
-    # Pool 1 reduces length: 25 -> 12 (for pool_size=2)
     len_after_pool1 = seq_len // pool_size
-    # Pool 2 reduces length: 12 -> 6 (for pool_size=2)
     len_after_pool2 = len_after_pool1 // pool_size
     
-    # Total inputs = Filters * Remaining Time Steps
     linear_input_size = n_filters2 * len_after_pool2
-    #linear_input_size = n_filters2 * seq_len  # No pooling used
-    
-   # print(f"Model Init: SeqLen {seq_len} -> Reduced to {len_after_pool2} steps -> Linear Input {linear_input_size}")
-    
+
     linear = nn.Linear(linear_input_size, 1)
 
     models = {
@@ -1129,28 +1208,43 @@ def init_kaiming_normal_for_conv(m):
 
 def forward_cnn(models, x):
     # Permute: PyTorch Conv1d expects [Batch, Channels, Time]
-    x = x.permute(0, 2, 1) 
-    
-    # Block 1: per-channel temporal filtering for mid-fusion,
-    # or dense temporal filtering for legacy checkpoints.
+    x = x.permute(0, 2, 1)
+
+    # ---------- split_fusion_3plus1 path ----------
+    if 'conv1_three' in models:
+        # Branch A: first 3 channels (fused sensors)
+        a = F.relu(models['bn1_three'](models['conv1_three'](x[:, :3, :])))
+        a = F.relu(models['bn2_three'](models['conv2_three'](a)))
+
+        # Branch B: 4th channel alone
+        b = F.relu(models['bn1_one'](models['conv1_one'](x[:, 3:4, :])))
+        b = F.relu(models['bn2_one'](models['conv2_one'](b)))
+
+        # Concatenate along channel axis and fuse with conv3
+        x = torch.cat([a, b], dim=1)
+        x = F.relu(models['bn3'](models['conv3'](x)))
+
+        # Two FC layers: flatten -> fc_hidden -> logit
+        x = x.reshape(x.size(0), -1)
+        x = F.relu(models['linear1'](x))
+        return models['linear2'](x)
+
+    # ---------- mid_fusion_pointwise / early_fusion path ----------
     x = models['conv1'](x)
     x = models['bn1'](x)
     x = F.relu(x)
     x = models['pool'](x)
 
-    # Mid-fusion stage: pointwise channel mixing at each time step.
     if 'conv_fuse' in models:
         x = models['conv_fuse'](x)
         x = models['bn_fuse'](x)
         x = F.relu(x)
     
-    # Block 2: temporal convolution on fused features
     x = models['conv2'](x)
     x = models['bn2'](x)
     x = F.relu(x)
     x = models['pool'](x)
     
-    # Flatten: [Batch, Channels, Time] -> [Batch, Features]
     x = x.reshape(x.size(0), -1)
     return models['linear'](x)
 
@@ -1208,6 +1302,8 @@ def train_model(
     pool_size: int = 2,
     fusion_channels: int = None,
     cnn_architecture: str = "mid_fusion_pointwise",
+    branch2_filters: int = 128,
+    fc_hidden: int = 500,
     hidden_dim: int = 64,
     prob_full_missing: float = 0.2,
     prob_block_missing: float = 0.3,
@@ -1262,6 +1358,8 @@ def train_model(
             pool_size=pool_size,
             fusion_channels=fusion_channels,
             cnn_architecture=cnn_architecture,
+            branch2_filters=branch2_filters,
+            fc_hidden=fc_hidden,
         )
         forward_fn = forward_cnn
      
@@ -1290,7 +1388,7 @@ def train_model(
     # pos_weight scales the loss for the minority class (Ramps).
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
-    history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
+    history = {'train_loss': [], 'val_loss': [], 'val_acc': [], 'val_pr_auc': []}
     
     # --- PER-EPOCH WEIGHT TRACKING ---
     weight_history = []  # List to store weight snapshots each epoch
@@ -1342,17 +1440,26 @@ def train_model(
             pred_cls = (val_preds > 0).float()
             acc = (pred_cls == y_val).float().mean()
             
+            val_probs = torch.sigmoid(val_preds).cpu().numpy().ravel()
+            y_val_np = y_val.cpu().numpy().ravel()
+            val_pr_auc = average_precision_score(y_val_np, val_probs)
+            
             history['val_loss'].append(v_loss.item())
             history['val_acc'].append(acc.item())
+            history['val_pr_auc'].append(val_pr_auc)
         
         #if (epoch+1) % 10 == 0:
-        print(f"Epoch {epoch+1}/{epochs}: Train Loss {avg_train_loss:.4f} | Val Loss {v_loss.item():.4f} | Val Acc {acc.item():.4f}")
+        print(f"Epoch {epoch+1}/{epochs}: Train Loss {avg_train_loss:.4f} | Val Loss {v_loss.item():.4f} | Val Acc {acc.item():.4f} | Val PR-AUC {val_pr_auc:.4f}")
 
         # --- CAPTURE WEIGHTS THIS EPOCH ---
-        epoch_snapshot = {
-            'epoch': epoch,
-            'conv1': copy.deepcopy(models['conv1'].state_dict()) if 'conv1' in models else None
-        }
+        epoch_snapshot = {'epoch': epoch}
+        if 'conv1' in models:
+            epoch_snapshot['conv1'] = copy.deepcopy(models['conv1'].state_dict())
+        elif 'conv1_three' in models:
+            epoch_snapshot['conv1_three'] = copy.deepcopy(models['conv1_three'].state_dict())
+            epoch_snapshot['conv1_one'] = copy.deepcopy(models['conv1_one'].state_dict())
+        else:
+            epoch_snapshot['conv1'] = None
         weight_history.append(epoch_snapshot)
 
     # --- CAPTURE FINAL WEIGHTS ---
@@ -1473,6 +1580,8 @@ def load_checkpoint(checkpoint_path, model_type='cnn'):
             pool_size=hyperparams.get('pool_size', 2),
             fusion_channels=hyperparams.get('fusion_channels'),
             cnn_architecture=hyperparams.get('cnn_architecture', 'early_fusion'),
+            branch2_filters=hyperparams.get('branch2_filters', 128),
+            fc_hidden=hyperparams.get('fc_hidden', 500),
         )
         forward_fn = forward_cnn
     
@@ -1749,6 +1858,10 @@ def plot_channel_importance_analysis(initial_weights, final_weights, output_fold
     """
     if channel_names is None:
         channel_names = CHANNEL_NAMES
+
+    if 'conv1' not in initial_weights:
+        print("Skipping channel-importance analysis (no conv1 in weights).")
+        return
     
     layout_init = get_conv1_channel_layout(initial_weights['conv1']['weight'], channel_names)
     layout_final = get_conv1_channel_layout(final_weights['conv1']['weight'], channel_names)
@@ -1948,6 +2061,10 @@ def plot_channel_importance_over_epochs(weight_history, output_folder=None, chan
     
     if not weight_history:
         print("Warning: weight_history is empty. Skipping epoch visualization.")
+        return
+
+    if 'conv1' not in weight_history[0]:
+        print("Skipping channel-importance-over-epochs (no conv1 in weight_history).")
         return
     
     n_epochs = len(weight_history)
@@ -2163,6 +2280,10 @@ def plot_excitation_inhibition_analysis(initial_weights, final_weights,
     """
     if channel_names is None:
         channel_names = CHANNEL_NAMES
+
+    if 'conv1' not in initial_weights:
+        print("Skipping E/I analysis (no conv1 in weights).")
+        return None
     
     layout_init = get_conv1_channel_layout(initial_weights['conv1']['weight'], channel_names)
     layout_final = get_conv1_channel_layout(final_weights['conv1']['weight'], channel_names)
@@ -2947,6 +3068,10 @@ def plot_excitation_inhibition_over_epochs(weight_history, output_folder=None, c
     if not weight_history:
         print("Warning: weight_history is empty. Skipping E/I epoch visualization.")
         return
+
+    if 'conv1' not in weight_history[0]:
+        print("Skipping E/I-over-epochs (no conv1 in weight_history).")
+        return
     
     n_epochs = len(weight_history)
     n_channels = len(channel_names)
@@ -3624,10 +3749,7 @@ def temporal_sensitivity_test(models, forward_fn, scaler, seq_len, output_folder
 
    """
 
-def evaluate_test_set(models, forward_fn, data, pos_weight):
-
-   
-
+def evaluate_test_set(models, forward_fn, data, pos_weight, output_folder=None):
 
     print("\n" + "="*30)
     print("EVALUATING ON TEST SET")
@@ -3641,28 +3763,30 @@ def evaluate_test_set(models, forward_fn, data, pos_weight):
         return
 
     # Set Eval Mode
-    models['conv1'].eval(); models['bn1'].eval()
-    models['conv2'].eval(); models['bn2'].eval()
-    
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
-
     for layer in models.values():
         layer.eval()
+    
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     with torch.inference_mode():
         logits = forward_fn(models, X_test)
         loss = criterion(logits, y_test)
         test_loss = loss.item()
         
+        probs = torch.sigmoid(logits).cpu().numpy().ravel()
         # Convert logits to 0 or 1
         preds = (logits > 0).float().cpu().numpy()
-        y_true = y_test.cpu().numpy()
+        y_true = y_test.cpu().numpy().ravel()
         
     # Calculate Metrics
-    accuracy = (preds == y_true).mean()
+    accuracy = (preds.ravel() == y_true).mean()
     prec = precision_score(y_true, preds, zero_division=0)
     rec = recall_score(y_true, preds, zero_division=0)
     cm = confusion_matrix(y_true, preds)
+    
+    # PR-AUC (threshold-independent)
+    test_pr_auc = average_precision_score(y_true, probs)
+    pr_precision, pr_recall, pr_thresholds = precision_recall_curve(y_true, probs)
     
     # Counts
     real_vals, real_counts = np.unique(y_true, return_counts=True)
@@ -3674,6 +3798,7 @@ def evaluate_test_set(models, forward_fn, data, pos_weight):
     print(f"Test Accuracy: {accuracy:.4f}")
     print(f"Precision:     {prec:.4f}")
     print(f"Recall:        {rec:.4f}")
+    print(f"PR-AUC:        {test_pr_auc:.4f}")
     print("-" * 30)
     print(f"Real Distribution:      {real_dict}")
     print(f"Predicted Distribution: {pred_dict}")
@@ -3681,6 +3806,21 @@ def evaluate_test_set(models, forward_fn, data, pos_weight):
     print("Confusion Matrix:")
     print(cm)
     print("="*30 + "\n")
+    
+    # --- Precision-Recall Curve Plot ---
+    fig_pr = plt.figure(figsize=(7, 5))
+    plt.step(pr_recall, pr_precision, where='post', color='blue', linewidth=2)
+    plt.fill_between(pr_recall, pr_precision, step='post', alpha=0.15, color='blue')
+    plt.title(f'Precision-Recall Curve  (PR-AUC = {test_pr_auc:.4f})')
+    plt.xlabel('Recall')
+    plt.ylabel('Precision')
+    plt.xlim([0.0, 1.05])
+    plt.ylim([0.0, 1.05])
+    plt.grid(True)
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig_pr, output_folder, "precision_recall_curve")
+    plt.show()
 
 
     
@@ -3952,13 +4092,15 @@ def plot_decision_boundary_slices(models, forward_fn, data, scaler, seq_len,
 #####################################################################################
 def plot_training_curves(history, output_folder=None):
     """
-    Plots the Loss and Accuracy curves after training.
+    Plots the Loss, Accuracy, and PR-AUC curves after training.
     Optionally saves to output_folder if provided.
     """
     epochs = range(1, len(history['val_loss']) + 1)
-    fig = plt.figure(figsize=(12, 5))
+    has_pr_auc = 'val_pr_auc' in history and len(history['val_pr_auc']) > 0
+    n_cols = 3 if has_pr_auc else 2
+    fig = plt.figure(figsize=(6 * n_cols, 5))
     
-    plt.subplot(1, 2, 1)
+    plt.subplot(1, n_cols, 1)
     plt.plot(epochs, history['train_loss'], label='Train')
     plt.plot(epochs, history['val_loss'], label='Val', linestyle='--')
     plt.title('Loss vs Epochs')
@@ -3967,13 +4109,23 @@ def plot_training_curves(history, output_folder=None):
     plt.legend()
     plt.grid(True)
     
-    plt.subplot(1, 2, 2)
+    plt.subplot(1, n_cols, 2)
     plt.plot(epochs, history['val_acc'], color='green', label='Val Acc')
     plt.title('Validation Accuracy')
     plt.xlabel('Epochs')
     plt.ylabel('Accuracy')
     plt.legend()
     plt.grid(True)
+    
+    if has_pr_auc:
+        plt.subplot(1, n_cols, 3)
+        plt.plot(epochs, history['val_pr_auc'], color='purple', label='Val PR-AUC')
+        plt.title('Validation PR-AUC vs Epochs')
+        plt.xlabel('Epochs')
+        plt.ylabel('PR-AUC (Average Precision)')
+        plt.ylim([0.0, 1.05])
+        plt.legend()
+        plt.grid(True)
     
     plt.tight_layout()
     if output_folder:
@@ -4904,12 +5056,19 @@ def evaluate_robustness(models, forward_fn, ablations, missing_mask=None,
     for layer in models.values():
         layer.eval()
     
+    def _safe_pr_auc(y, probs):
+        """Return PR-AUC if both classes present, else 0.0."""
+        if len(np.unique(y)) < 2:
+            return 0.0
+        return average_precision_score(y, probs)
+
     for name, (X, y) in ablations.items():
         X, y = X.to(device), y.to(device)
         with torch.inference_mode():
             logits = forward_fn(models, X)
             preds = (torch.sigmoid(logits) >= 0.5).float()
             
+            probs_np = torch.sigmoid(logits).squeeze().cpu().numpy()
             preds_np = preds.squeeze().cpu().numpy()
             y_np = y.squeeze().cpu().numpy()
         
@@ -4943,19 +5102,21 @@ def evaluate_robustness(models, forward_fn, ablations, missing_mask=None,
                 acc = (preds_np[clean_idx] == y_np[clean_idx]).mean()
                 prec = precision_score(y_np[clean_idx], preds_np[clean_idx], zero_division=0)
                 rec = recall_score(y_np[clean_idx], preds_np[clean_idx], zero_division=0)
+                pr_auc = _safe_pr_auc(y_np[clean_idx], probs_np[clean_idx])
                 
                 if n_excluded > 0:
                     multi_acc = (preds_np[any_issue] == y_np[any_issue]).mean()
                 else:
                     multi_acc = None
             elif filter_missing and n_clean == 0:
-                acc, prec, rec = 0.0, 0.0, 0.0
+                acc, prec, rec, pr_auc = 0.0, 0.0, 0.0, 0.0
                 multi_acc = (preds_np == y_np).mean()
             else:
                 # TEST MODE: use ALL samples, just report stats
                 acc = (preds_np == y_np).mean()
                 prec = precision_score(y_np, preds_np, zero_division=0)
                 rec = recall_score(y_np, preds_np, zero_division=0)
+                pr_auc = _safe_pr_auc(y_np, probs_np)
                 
                 if n_excluded > 0:
                     multi_acc = (preds_np[any_issue] == y_np[any_issue]).mean()
@@ -4964,6 +5125,7 @@ def evaluate_robustness(models, forward_fn, ablations, missing_mask=None,
             
             results[name] = {
                 'accuracy': acc, 'precision': prec, 'recall': rec,
+                'pr_auc': pr_auc,
                 'n_clean': n_clean, 'n_multi_missing': n_excluded,
                 'multi_missing_acc': multi_acc
             }
@@ -4973,9 +5135,11 @@ def evaluate_robustness(models, forward_fn, ablations, missing_mask=None,
             acc = (preds_np == y_np).mean()
             prec = precision_score(y_np, preds_np, zero_division=0)
             rec = recall_score(y_np, preds_np, zero_division=0)
+            pr_auc = _safe_pr_auc(y_np, probs_np)
             
             results[name] = {
                 'accuracy': acc, 'precision': prec, 'recall': rec,
+                'pr_auc': pr_auc,
                 'n_clean': n_total, 'n_multi_missing': 0,
                 'multi_missing_acc': None
             }
@@ -4992,8 +5156,8 @@ def _write_robustness_section(f, robustness_results, section_title):
     f.write(f"{section_title}\n")
     f.write("=" * 120 + "\n\n")
     
-    f.write(f"{'Ablation Type':<20} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'Acc Delta':>12} {'N_clean':>8} {'N_multi':>8} {'Multi_Acc':>10}\n")
-    f.write("-" * 100 + "\n")
+    f.write(f"{'Ablation Type':<20} {'Accuracy':>10} {'Precision':>10} {'Recall':>10} {'PR-AUC':>10} {'Acc Delta':>12} {'N_clean':>8} {'N_multi':>8} {'Multi_Acc':>10}\n")
+    f.write("-" * 110 + "\n")
     
     clean_acc = robustness_results.get('clean', {}).get('accuracy', 0)
     
@@ -5001,8 +5165,10 @@ def _write_robustness_section(f, robustness_results, section_title):
         acc = metrics['accuracy']
         prec = metrics['precision']
         rec = metrics['recall']
+        pr_auc = metrics.get('pr_auc', None)
         delta = acc - clean_acc if name != 'clean' else 0.0
         delta_str = f"{delta:+.4f}" if name != 'clean' else "---"
+        pr_auc_str = f"{pr_auc:>10.4f}" if pr_auc is not None else f"{'N/A':>10}"
         
         n_clean = metrics.get('n_clean', '---')
         n_multi = metrics.get('n_multi_missing', 0)
@@ -5012,7 +5178,7 @@ def _write_robustness_section(f, robustness_results, section_title):
         n_multi_str = f"{n_multi:>8}" if n_multi > 0 else f"{'---':>8}"
         multi_acc_str = f"{multi_acc:>10.4f}" if multi_acc is not None else f"{'N/A':>10}"
         
-        f.write(f"{name:<20} {acc:>10.4f} {prec:>10.4f} {rec:>10.4f} {delta_str:>12} {n_clean_str} {n_multi_str} {multi_acc_str}\n")
+        f.write(f"{name:<20} {acc:>10.4f} {prec:>10.4f} {rec:>10.4f} {pr_auc_str} {delta_str:>12} {n_clean_str} {n_multi_str} {multi_acc_str}\n")
     
     f.write("\n" + "-" * 100 + "\n")
     f.write("SUMMARY STATISTICS\n")
@@ -5020,15 +5186,22 @@ def _write_robustness_section(f, robustness_results, section_title):
     
     clean = robustness_results.get('clean', {})
     f.write(f"Clean Baseline:  Acc={clean.get('accuracy', 0):.4f}  "
-            f"Prec={clean.get('precision', 0):.4f}  Rec={clean.get('recall', 0):.4f}\n\n")
+            f"Prec={clean.get('precision', 0):.4f}  Rec={clean.get('recall', 0):.4f}  "
+            f"PR-AUC={clean.get('pr_auc', 0):.4f}\n\n")
     
+    def _avg_pr_auc(metrics_dict):
+        vals = [v['pr_auc'] for v in metrics_dict.values() if 'pr_auc' in v]
+        return np.mean(vals) if vals else None
+
     # Sensor full-missing averages (using clean-subset metrics)
     full_metrics = {k: v for k, v in robustness_results.items() if '_full' in k}
     if full_metrics:
         avg_acc = np.mean([v['accuracy'] for v in full_metrics.values()])
         avg_prec = np.mean([v['precision'] for v in full_metrics.values()])
         avg_rec = np.mean([v['recall'] for v in full_metrics.values()])
-        f.write(f"Sensor Full-Missing Avg (clean subset):  Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
+        avg_prauc = _avg_pr_auc(full_metrics)
+        prauc_str = f"  PR-AUC={avg_prauc:.4f}" if avg_prauc is not None else ""
+        f.write(f"Sensor Full-Missing Avg (clean subset):  Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}{prauc_str}\n")
     
     # Sensor block-missing averages
     block_metrics = {k: v for k, v in robustness_results.items() if '_block' in k}
@@ -5036,7 +5209,9 @@ def _write_robustness_section(f, robustness_results, section_title):
         avg_acc = np.mean([v['accuracy'] for v in block_metrics.values()])
         avg_prec = np.mean([v['precision'] for v in block_metrics.values()])
         avg_rec = np.mean([v['recall'] for v in block_metrics.values()])
-        f.write(f"Sensor Block-Missing Avg (clean subset): Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
+        avg_prauc = _avg_pr_auc(block_metrics)
+        prauc_str = f"  PR-AUC={avg_prauc:.4f}" if avg_prauc is not None else ""
+        f.write(f"Sensor Block-Missing Avg (clean subset): Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}{prauc_str}\n")
     
     # Multi-sensor missingness averages (clean subset: cases 2–5)
     multi_keys = [
@@ -5050,7 +5225,9 @@ def _write_robustness_section(f, robustness_results, section_title):
         avg_acc = np.mean([v['accuracy'] for v in multi_metrics.values()])
         avg_prec = np.mean([v['precision'] for v in multi_metrics.values()])
         avg_rec = np.mean([v['recall'] for v in multi_metrics.values()])
-        f.write(f"Multi-Sensor Missing Avg (clean subset): Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
+        avg_prauc = _avg_pr_auc(multi_metrics)
+        prauc_str = f"  PR-AUC={avg_prauc:.4f}" if avg_prauc is not None else ""
+        f.write(f"Multi-Sensor Missing Avg (clean subset): Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}{prauc_str}\n")
     
     # Prev_A1 ablation averages (all samples, not filtered)
     prev_a1_metrics = {k: v for k, v in robustness_results.items() if 'prev_a1' in k and not k in multi_keys}
@@ -5058,7 +5235,9 @@ def _write_robustness_section(f, robustness_results, section_title):
         avg_acc = np.mean([v['accuracy'] for v in prev_a1_metrics.values()])
         avg_prec = np.mean([v['precision'] for v in prev_a1_metrics.values()])
         avg_rec = np.mean([v['recall'] for v in prev_a1_metrics.values()])
-        f.write(f"Prev_A1 Ablation Avg (all samples):      Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}\n")
+        avg_prauc = _avg_pr_auc(prev_a1_metrics)
+        prauc_str = f"  PR-AUC={avg_prauc:.4f}" if avg_prauc is not None else ""
+        f.write(f"Prev_A1 Ablation Avg (all samples):      Acc={avg_acc:.4f}  Prec={avg_prec:.4f}  Rec={avg_rec:.4f}{prauc_str}\n")
     
     f.write("\nNote: Sensor ablation metrics computed on CLEAN subset only (no other sensor pre-missing).\n")
     f.write("      Prev_A1 ablations use ALL samples. Multi_Acc shows accuracy on excluded samples.\n")
@@ -5279,12 +5458,16 @@ def test_channel_count(X_train, models, model_type='cnn'):
     results['data_has_4_channels'] = X_train.shape[2] == 4
     
     if model_type == 'cnn':
-        results['conv1_expects_4_channels'] = models['conv1'].in_channels == 4
-        results['conv1_grouped_by_channel'] = models['conv1'].groups == models['conv1'].in_channels
-        results['conv_fuse_present'] = 'conv_fuse' in models
-        results['conv_fuse_is_pointwise'] = (
-            'conv_fuse' in models and models['conv_fuse'].kernel_size == (1,)
-        )
+        if 'conv1_three' in models:
+            results['conv1_three_expects_3_channels'] = models['conv1_three'].in_channels == 3
+            results['conv1_one_expects_1_channel'] = models['conv1_one'].in_channels == 1
+        else:
+            results['conv1_expects_4_channels'] = models['conv1'].in_channels == 4
+            results['conv1_grouped_by_channel'] = models['conv1'].groups == models['conv1'].in_channels
+            results['conv_fuse_present'] = 'conv_fuse' in models
+            results['conv_fuse_is_pointwise'] = (
+                'conv_fuse' in models and models['conv_fuse'].kernel_size == (1,)
+            )
     else:
         results['lstm_expects_4_channels'] = models['lstm'].input_size == 4
     
@@ -5543,8 +5726,8 @@ def run_validation_checks(X_train, X_val,
 if __name__ == "__main__":
     
     # UPDATE YOUR PATHS HERE
-    TRAIN_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\training" 
-    TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\testing"
+    TRAIN_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\train poster" 
+    TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\test poster"
     
     ##Noisy test data. For model validation.
     #TEST_DIR = r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\Data For Model\Test Data"  #
@@ -5557,22 +5740,24 @@ if __name__ == "__main__":
     # ==========================================
     HYPERPARAMS = {
         'sequence_length': 30,
-        'learning_rate': 0.000001,
-        'epochs': 150,
+        'learning_rate': 0.0000005,
+        'epochs': 30,
         'batch_size': 128,
-        'cnn_architecture': 'mid_fusion_pointwise',
-        'n_filters1': 128,
-        'fusion_channels': 128,
-        'n_filters2': 256,
-        'kernel_size': 3,
-        'pool_size': 2,
+        'cnn_architecture': 'split_fusion_3plus1',
+        'n_filters1': 150,
+        'fusion_channels': 200,
+        'n_filters2': 250,
+        'kernel_size': 7,
+        'pool_size': 2,                      #'mid_fusion_pointwise' or 'split_fusion_3plus1' or 'early_fusion'
+        'branch2_filters': 150,             # split_fusion_3plus1: filters per branch in conv2
+        'fc_hidden': 500,                   # split_fusion_3plus1: hidden units in first FC layer
         'hidden_dim': 64,  # For LSTM
         # Dropout/Missing data augmentation
-        'prob_full_missing': 0.2,          # 20% chance of full window dropout
-        'prob_block_missing': 0.2,         # 30% chance of block dropout
-        'dropout_min_block_pct': 0.2,      # Min block = 20% of seq_length
-        'dropout_max_block_pct': 0.8,      # Max block = 80% of seq_length
-        'missing_value': -15,              # Placeholder for missing/dropped data
+        'prob_full_missing': 0.0,          # 20% chance of full window dropout
+        'prob_block_missing': 0.0,         # 30% chance of block dropout
+        'dropout_min_block_pct': 0.0,      # Min block = 20% of seq_length
+        'dropout_max_block_pct': 0.0,      # Max block = 80% of seq_length
+        'missing_value': 0.0,              # Placeholder for missing/dropped data
     }
     
     SEQ_LEN = HYPERPARAMS['sequence_length']
@@ -5616,6 +5801,8 @@ if __name__ == "__main__":
         kernel_size=HYPERPARAMS['kernel_size'],
         pool_size=HYPERPARAMS['pool_size'],
         cnn_architecture=HYPERPARAMS['cnn_architecture'],
+        branch2_filters=HYPERPARAMS['branch2_filters'],
+        fc_hidden=HYPERPARAMS['fc_hidden'],
         hidden_dim=HYPERPARAMS['hidden_dim'],
         prob_full_missing=HYPERPARAMS['prob_full_missing'],
         prob_block_missing=HYPERPARAMS['prob_block_missing'],
@@ -5727,60 +5914,64 @@ if __name__ == "__main__":
     )
     
     # E/I Consistency check against expected physics
-    print_ei_consistency_check(ei_ratios, channel_names=CHANNEL_NAMES)
+    if ei_ratios is not None:
+        print_ei_consistency_check(ei_ratios, channel_names=CHANNEL_NAMES)
     
     # ==========================================
     # 5. EXISTING VISUALIZATIONS (kept for compatibility)
     # ==========================================
-    viz_layer(initial_weights, final_weights, "conv1", include_bias=False)
+    if "conv1" in initial_weights:
+        viz_layer(initial_weights, final_weights, "conv1", include_bias=False)
     viz_layer(initial_weights, final_weights, "linear", include_bias=True)
     #plot_conv1_input_channel_hists(models, initial_weights=initial_weights, final_weights=final_weights)
 
     #########################################################################
     # Save weights comparison to text file (in output folder)
+    # Only runs for architectures that have a single conv1 layer.
     #########################################################################
-    w_init = initial_weights["conv1"]["weight"].detach().cpu().numpy()
-    w_final = final_weights["conv1"]["weight"].detach().cpu().numpy()
-    b_init = initial_weights["conv1"]["bias"].detach().cpu().numpy()
-    b_final = final_weights["conv1"]["bias"].detach().cpu().numpy()
-   
-    out_path = os.path.join(OUTPUT_FOLDER, "conv1_weights_comparison.txt")
+    if "conv1" in initial_weights:
+        w_init = initial_weights["conv1"]["weight"].detach().cpu().numpy()
+        w_final = final_weights["conv1"]["weight"].detach().cpu().numpy()
+        b_init = initial_weights["conv1"]["bias"].detach().cpu().numpy()
+        b_final = final_weights["conv1"]["bias"].detach().cpu().numpy()
+       
+        out_path = os.path.join(OUTPUT_FOLDER, "conv1_weights_comparison.txt")
 
-    with open(out_path, 'w') as f, redirect_stdout(f):
-        print("conv1.weight shape:", w_init.shape)
-        print("conv1.bias shape:  ", b_init.shape)
-        print("conv1 weight count (no bias):", w_init.size)
-        print("conv1 bias count:", b_init.size)
-        layout_init = get_conv1_channel_layout(w_init, CHANNEL_NAMES)
-        layout_final = get_conv1_channel_layout(w_final, CHANNEL_NAMES)
-        print("conv1 logical layout:", layout_init["layout"])
+        with open(out_path, 'w') as f, redirect_stdout(f):
+            print("conv1.weight shape:", w_init.shape)
+            print("conv1.bias shape:  ", b_init.shape)
+            print("conv1 weight count (no bias):", w_init.size)
+            print("conv1 bias count:", b_init.size)
+            layout_init = get_conv1_channel_layout(w_init, CHANNEL_NAMES)
+            layout_final = get_conv1_channel_layout(w_final, CHANNEL_NAMES)
+            print("conv1 logical layout:", layout_init["layout"])
 
-        for in_ch, ch_name in enumerate(CHANNEL_NAMES):
-            init_ch = layout_init["channel_blocks"][in_ch]
-            final_ch = layout_final["channel_blocks"][in_ch]
+            for in_ch, ch_name in enumerate(CHANNEL_NAMES):
+                init_ch = layout_init["channel_blocks"][in_ch]
+                final_ch = layout_final["channel_blocks"][in_ch]
+
+                print("\n" + "="*80)
+                print(
+                    f"INPUT CHANNEL {in_ch}: {ch_name}  |  weights per channel = {init_ch.size} "
+                    f"({init_ch.shape[0]} filters × {init_ch.shape[1]} kernel)"
+                )
+                print("="*80)
+
+                for out_ch in range(init_ch.shape[0]):
+                    ki = init_ch[out_ch]
+                    kf = final_ch[out_ch]
+                    print(
+                        f"filter {out_ch:03d} | "
+                        f"init [{ki[0]: .8f}, {ki[1]: .8f}, {ki[2]: .8f}]  ->  "
+                        f"final [{kf[0]: .8f}, {kf[1]: .8f}, {kf[2]: .8f}]"
+                    )   
 
             print("\n" + "="*80)
-            print(
-                f"INPUT CHANNEL {in_ch}: {ch_name}  |  weights per channel = {init_ch.size} "
-                f"({init_ch.shape[0]} filters × {init_ch.shape[1]} kernel)"
-            )
+            print("CONV1 BIAS: initial -> final (per output filter)")
             print("="*80)
-
-            for out_ch in range(init_ch.shape[0]):
-                ki = init_ch[out_ch]
-                kf = final_ch[out_ch]
-                print(
-                    f"filter {out_ch:03d} | "
-                    f"init [{ki[0]: .8f}, {ki[1]: .8f}, {ki[2]: .8f}]  ->  "
-                    f"final [{kf[0]: .8f}, {kf[1]: .8f}, {kf[2]: .8f}]"
-                )   
-
-        print("\n" + "="*80)
-        print("CONV1 BIAS: initial -> final (per output filter)")
-        print("="*80)
-        for out_ch in range(b_init.shape[0]):
-            print(f"filter {out_ch:03d} | init_bias {b_init[out_ch]: .8f} -> final_bias {b_final[out_ch]: .8f}")
-    print(f"Saved: {out_path}")
+            for out_ch in range(b_init.shape[0]):
+                print(f"filter {out_ch:03d} | init_bias {b_init[out_ch]: .8f} -> final_bias {b_final[out_ch]: .8f}")
+        print(f"Saved: {out_path}")
 
     # ==========================================
     # 6. Plot Training Curves (with saving)
@@ -5790,7 +5981,14 @@ if __name__ == "__main__":
     # ==========================================
     # 7. Evaluate on Test Set
     # ==========================================
-    evaluate_test_set(models, fwd_fn, data, pos_weight)
+    evaluate_test_set(models, fwd_fn, data, pos_weight, output_folder=OUTPUT_FOLDER)
+    save_test_probability_report(
+        OUTPUT_FOLDER,
+        models,
+        fwd_fn,
+        data,
+        test_ablations=test_ablations
+    )
 
     _san_buf = io.StringIO()
     _tee_san = TeeWriter(sys.stdout, _san_buf)
