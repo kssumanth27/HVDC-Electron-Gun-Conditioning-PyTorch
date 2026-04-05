@@ -26,7 +26,9 @@ import matplotlib.pyplot as plt
 import glob
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
-from sklearn.metrics import confusion_matrix, precision_score, recall_score, ConfusionMatrixDisplay
+from sklearn.metrics import (confusion_matrix, precision_score, recall_score,
+                             f1_score, fbeta_score, ConfusionMatrixDisplay)
+import json
 
 from mpl_toolkits.mplot3d import Axes3D  # needed for 3D plots
 import copy
@@ -35,8 +37,8 @@ import warnings
 import random
 random.seed(33)
 np.random.seed(33)
-torch.manual_seed(9821)
-torch.cuda.manual_seed_all(9821)
+torch.manual_seed(545)
+torch.cuda.manual_seed_all(545)
 torch.backends.cudnn.deterministic = True
 
 # Hide most noisy warnings so prints stay visible
@@ -182,6 +184,117 @@ def save_text_report(output_folder, filename, content):
     filepath = os.path.join(output_folder, f"{filename}.txt")
     with open(filepath, "w", encoding="utf-8") as f:
         f.write(content)
+    print(f"Saved: {filepath}")
+
+
+def save_epoch_history_report(output_folder, history):
+    """Write per-epoch training metrics to a JSON file."""
+    n_epochs = len(history['train_loss'])
+    records = []
+    for i in range(n_epochs):
+        rec = {
+            'epoch': i,
+            'train_loss': history['train_loss'][i],
+            'val_loss': history['val_loss'][i],
+            'train_acc': history.get('train_acc', [None]*n_epochs)[i],
+            'val_acc': history['val_acc'][i],
+            'test_acc': history.get('test_acc', [None]*n_epochs)[i],
+            'train_f1': history.get('train_f1', [None]*n_epochs)[i],
+            'val_f1': history.get('val_f1', [None]*n_epochs)[i],
+            'train_f05': history.get('train_f05', [None]*n_epochs)[i],
+            'val_f05': history.get('val_f05', [None]*n_epochs)[i],
+            'train_f2': history.get('train_f2', [None]*n_epochs)[i],
+            'val_f2': history.get('val_f2', [None]*n_epochs)[i],
+        }
+        records.append(rec)
+    filepath = os.path.join(output_folder, "epoch_history.json")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(records, f, indent=2)
+    print(f"Saved: {filepath}")
+
+
+def save_test_metrics_report(output_folder, test_metrics, data, pos_weight):
+    """
+    Write test-set evaluation metrics, class distributions, and pos_weight
+    to a single JSON file suitable for publication tables.
+    """
+    y_train = data['y_train'].cpu().numpy().flatten()
+    y_val = data['y_val'].cpu().numpy().flatten()
+    y_test = data['y_test'].cpu().numpy().flatten()
+
+    report = {
+        'test_metrics': test_metrics,
+        'class_distribution': {
+            'train': {
+                'stable_0': int(np.sum(y_train == 0)),
+                'increase_1': int(np.sum(y_train == 1)),
+            },
+            'validation': {
+                'stable_0': int(np.sum(y_val == 0)),
+                'increase_1': int(np.sum(y_val == 1)),
+            },
+            'test': {
+                'stable_0': int(np.sum(y_test == 0)),
+                'increase_1': int(np.sum(y_test == 1)),
+            },
+        },
+        'pos_weight': float(pos_weight.item()) if torch.is_tensor(pos_weight) else float(pos_weight),
+    }
+    filepath = os.path.join(output_folder, "test_metrics.json")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
+    print(f"Saved: {filepath}")
+
+
+def save_model_architecture_report(output_folder, models, hyperparams, model_type, data):
+    """
+    Write a structured model architecture / parameter table to JSON,
+    suitable for placing beside an architecture diagram in a presentation.
+    """
+    seq_len = data['X_train'].shape[1]
+    input_channels = data['X_train'].shape[2]
+
+    layers_table = []
+    total_params = 0
+    for layer_name, layer in models.items():
+        layer_trainable = 0
+        param_shapes = {}
+        for pname, p in layer.named_parameters():
+            if p.requires_grad:
+                num = p.numel()
+                layer_trainable += num
+                param_shapes[pname] = list(p.shape)
+        total_params += layer_trainable
+        layers_table.append({
+            'layer_name': layer_name,
+            'type': layer.__class__.__name__,
+            'param_shapes': param_shapes,
+            'trainable_params': layer_trainable,
+        })
+
+    report = {
+        'model_type': model_type,
+        'input_channels': input_channels,
+        'sequence_length': seq_len,
+        'layers': layers_table,
+        'total_trainable_params': total_params,
+        'hyperparameters': {
+            'learning_rate': hyperparams.get('learning_rate'),
+            'epochs': hyperparams.get('epochs'),
+            'batch_size': hyperparams.get('batch_size'),
+            'n_filters1': hyperparams.get('n_filters1'),
+            'n_filters2': hyperparams.get('n_filters2'),
+            'kernel_size': hyperparams.get('kernel_size'),
+            'pool_size': hyperparams.get('pool_size'),
+            'hidden_dim': hyperparams.get('hidden_dim'),
+            'prob_full_missing': hyperparams.get('prob_full_missing'),
+            'prob_block_missing': hyperparams.get('prob_block_missing'),
+            'early_stopping_patience': hyperparams.get('early_stopping_patience'),
+        },
+    }
+    filepath = os.path.join(output_folder, "model_architecture.json")
+    with open(filepath, "w", encoding="utf-8") as f:
+        json.dump(report, f, indent=2)
     print(f"Saved: {filepath}")
 
 
@@ -1059,10 +1172,10 @@ def create_cnn_model(
     # Pool 1 reduces length: 25 -> 12 (for pool_size=2)
     len_after_pool1 = seq_len // pool_size
     # Pool 2 reduces length: 12 -> 6 (for pool_size=2)
-    len_after_pool2 = len_after_pool1 // pool_size
+    #len_after_pool2 = len_after_pool1 // pool_size
     
     # Total inputs = Filters * Remaining Time Steps
-    linear_input_size = n_filters2 * len_after_pool2
+    linear_input_size = n_filters2 * len_after_pool1
     #linear_input_size = n_filters2 * seq_len  # No pooling used
     
    # print(f"Model Init: SeqLen {seq_len} -> Reduced to {len_after_pool2} steps -> Linear Input {linear_input_size}")
@@ -1074,7 +1187,7 @@ def create_cnn_model(
 
 def init_kaiming_normal_for_conv(m):
     # Only touches Conv1d/Conv2d/Conv3d
-    if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d)):
+    if isinstance(m, (nn.Conv1d, nn.Conv2d, nn.Conv3d, nn.Linear)):
         # For ReLU-like nonlinearities (your model uses ReLU)
         nn.init.kaiming_normal_(m.weight, mode="fan_out", nonlinearity="relu")
         if m.bias is not None:
@@ -1088,7 +1201,7 @@ def forward_cnn(models, x):
     x = models['conv1'](x)
     x = models['bn1'](x)
     x = F.relu(x)
-    x = models['pool'](x)
+    #x = models['pool'](x)
     
     # Block 2
     x = models['conv2'](x)
@@ -1100,7 +1213,7 @@ def forward_cnn(models, x):
     x = models['conv3'](x)
     x = models['bn3'](x)
     x = F.relu(x)
-   # x = models['pool'](x)
+    #x = models['pool'](x)
 
     # Flatten: [Batch, Channels, Time] -> [Batch, Features]
     x = x.reshape(x.size(0), -1)
@@ -1164,6 +1277,7 @@ def train_model(
     min_block_pct: float = 0.2,
     max_block_pct: float = 0.8,
     missing_value: float = 0.0,
+    early_stopping_patience: int = 10,
 ):
 
     """
@@ -1213,6 +1327,8 @@ def train_model(
         )
         forward_fn = forward_cnn
      
+        #for layer in models.values():
+         #   layer.apply(init_kaiming_normal_for_conv)
 
      # >>> PASTE POINT-2 HERE (right after CNN creation) <<<
     # for k in ["conv1", "conv2"]:
@@ -1238,7 +1354,22 @@ def train_model(
     # pos_weight scales the loss for the minority class (Ramps).
     criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
     
-    history = {'train_loss': [], 'val_loss': [], 'val_acc': []}
+    history = {
+        'train_loss': [], 'val_loss': [],
+        'train_acc': [], 'val_acc': [], 'test_acc': [],
+        'train_f1': [], 'val_f1': [],
+        'train_f05': [], 'val_f05': [],
+        'train_f2': [], 'val_f2': [],
+    }
+    
+    X_test, y_test = data['X_test'], data['y_test']
+    has_test = len(X_test) > 0
+    
+    # --- EARLY STOPPING STATE ---
+    best_val_loss = float('inf')
+    best_epoch = 0
+    epochs_without_improvement = 0
+    best_state_dict = copy.deepcopy({name: layer.state_dict() for name, layer in models.items()})
     
     # --- PER-EPOCH WEIGHT TRACKING ---
     weight_history = []  # List to store weight snapshots each epoch
@@ -1246,20 +1377,15 @@ def train_model(
     for epoch in range(epochs):
         
         # --- TRAIN LOOP (Mini-Batches) ---
-        if model_type == 'lstm':
-             models['lstm'].train() 
-        else:
-             models['conv1'].train()
-             models['bn1'].train()
-            
-             models['conv2'].train()
-             models['bn2'].train()
-             #models['conv3'].train()
-   
+        for layer in models.values():
+            layer.train()
         
         epoch_loss = 0.0
+        epoch_correct = 0
+        epoch_total = 0
+        all_train_preds = []
+        all_train_labels = []
         for batch_X, batch_y in train_loader:
-            # Apply sensor dropout augmentation to this batch
             batch_X = apply_sensor_dropout(
                 batch_X, 
                 prob_full_missing=prob_full_missing,
@@ -1275,33 +1401,71 @@ def train_model(
             loss.backward()
             optimizer.step()
             epoch_loss += loss.item() * batch_X.size(0)
+            epoch_correct += ((preds > 0).float() == batch_y).float().sum().item()
+            epoch_total += batch_X.size(0)
+            all_train_preds.append((preds.detach() > 0).float().cpu().numpy())
+            all_train_labels.append(batch_y.detach().cpu().numpy())
             
         avg_train_loss = epoch_loss / len(train_loader.dataset)
+        train_acc = epoch_correct / epoch_total
         history['train_loss'].append(avg_train_loss)
+        history['train_acc'].append(train_acc)
+        
+        all_train_preds = np.concatenate(all_train_preds).flatten()
+        all_train_labels = np.concatenate(all_train_labels).flatten()
+        train_f1 = float(f1_score(all_train_labels, all_train_preds, zero_division=0))
+        train_f05 = float(fbeta_score(all_train_labels, all_train_preds, beta=0.5, zero_division=0))
+        train_f2 = float(fbeta_score(all_train_labels, all_train_preds, beta=2.0, zero_division=0))
+        history['train_f1'].append(train_f1)
+        history['train_f05'].append(train_f05)
+        history['train_f2'].append(train_f2)
 
-         # --- VAL LOOP (Full Batch usually fine for Val) ---
-        if model_type == 'lstm':
-             models['lstm'].eval() 
-        else:
-             models['conv1'].eval()
-             models['bn1'].eval()
-             models['conv2'].eval()
-             models['bn2'].eval()
-             #models['conv3'].eval()
-        
-        
+        # --- VAL + TEST LOOP (eval mode) ---
+        for layer in models.values():
+            layer.eval()
 
         with torch.inference_mode():
             val_preds = forward_fn(models, X_val)
             v_loss = criterion(val_preds, y_val)
-            pred_cls = (val_preds > 0).float()
-            acc = (pred_cls == y_val).float().mean()
+            val_acc = ((val_preds > 0).float() == y_val).float().mean().item()
             
             history['val_loss'].append(v_loss.item())
-            history['val_acc'].append(acc.item())
+            history['val_acc'].append(val_acc)
+
+            val_preds_binary = (val_preds > 0).float().cpu().numpy().flatten()
+            val_labels = y_val.cpu().numpy().flatten()
+            val_f1 = float(f1_score(val_labels, val_preds_binary, zero_division=0))
+            val_f05 = float(fbeta_score(val_labels, val_preds_binary, beta=0.5, zero_division=0))
+            val_f2 = float(fbeta_score(val_labels, val_preds_binary, beta=2.0, zero_division=0))
+            history['val_f1'].append(val_f1)
+            history['val_f05'].append(val_f05)
+            history['val_f2'].append(val_f2)
+
+            if has_test:
+                test_preds = forward_fn(models, X_test)
+                test_acc = ((test_preds > 0).float() == y_test).float().mean().item()
+            else:
+                test_acc = float('nan')
+            history['test_acc'].append(test_acc)
         
-        #if (epoch+1) % 10 == 0:
-        print(f"Epoch {epoch+1}/{epochs}: Train Loss {avg_train_loss:.4f} | Val Loss {v_loss.item():.4f} | Val Acc {acc.item():.4f}")
+        print(f"Epoch {epoch}/{epochs-1}: Train Loss {avg_train_loss:.4f} | Val Loss {v_loss.item():.4f} | "
+              f"Train Acc {train_acc:.4f} | Val Acc {val_acc:.4f} | Test Acc {test_acc:.4f} | "
+              f"Train F1 {train_f1:.4f} | Val F1 {val_f1:.4f} | Train F0.5 {train_f05:.4f} | Val F0.5 {val_f05:.4f} | "
+              f"Train F2 {train_f2:.4f} | Val F2 {val_f2:.4f}")
+
+        # --- EARLY STOPPING CHECK ---
+        current_val_loss = v_loss.item()
+        if current_val_loss < best_val_loss:
+            best_val_loss = current_val_loss
+            best_epoch = epoch
+            epochs_without_improvement = 0
+            best_state_dict = copy.deepcopy({name: layer.state_dict() for name, layer in models.items()})
+        else:
+            epochs_without_improvement += 1
+            if epochs_without_improvement >= early_stopping_patience:
+                print(f"\n>>> Early stopping triggered at epoch {epoch}. "
+                      f"No val_loss improvement for {early_stopping_patience} epochs.")
+                break
 
         # --- CAPTURE WEIGHTS THIS EPOCH ---
         epoch_snapshot = {
@@ -1310,10 +1474,17 @@ def train_model(
         }
         weight_history.append(epoch_snapshot)
 
-    # --- CAPTURE FINAL WEIGHTS ---
+    # --- RESTORE BEST-EPOCH WEIGHTS ---
+    for name, layer in models.items():
+        layer.load_state_dict(best_state_dict[name])
+    print(f">>> Restored best weights from epoch {best_epoch} (val_loss={best_val_loss:.6f}).")
+    
+    # --- CAPTURE FINAL WEIGHTS (from best epoch) ---
     final_weights = {name: layer.state_dict() for name, layer in models.items()}
-    print(">>> Final trained model weights have been captured.")
+    print(">>> Final model weights correspond to best validation-loss epoch.")
     print(f">>> Weight history captured for {len(weight_history)} epochs.")
+    print(f">>> Training summary: best_epoch={best_epoch}, best_val_loss={best_val_loss:.6f}, "
+          f"last_epoch_run={len(history['train_loss'])-1}, stopped_early={epochs_without_improvement >= early_stopping_patience}")
             
     return models, forward_fn, history, initial_weights, final_weights, weight_history
 
@@ -3502,55 +3673,54 @@ def temporal_sensitivity_test(models, forward_fn, scaler, seq_len, output_folder
    """
 
 def evaluate_test_set(models, forward_fn, data, pos_weight):
-
-   
-
-
+    """
+    Evaluates the trained model on the test set.
+    Returns a metrics dict with loss, accuracy, precision, recall,
+    F0.5, F1, F2.0, and confusion matrix for downstream reporting.
+    """
     print("\n" + "="*30)
     print("EVALUATING ON TEST SET")
     print("="*30)
     
     X_test, y_test = data['X_test'], data['y_test']
     
-    # Safety check if test set is empty
     if len(X_test) == 0:
         print("Test set is empty. Cannot evaluate.")
-        return
-
-    # Set Eval Mode
-    models['conv1'].eval(); models['bn1'].eval()
-    models['conv2'].eval(); models['bn2'].eval()
-    
-    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
+        return {}
 
     for layer in models.values():
         layer.eval()
+    
+    criterion = nn.BCEWithLogitsLoss(pos_weight=pos_weight)
 
     with torch.inference_mode():
         logits = forward_fn(models, X_test)
         loss = criterion(logits, y_test)
         test_loss = loss.item()
         
-        # Convert logits to 0 or 1
         preds = (logits > 0).float().cpu().numpy()
         y_true = y_test.cpu().numpy()
         
-    # Calculate Metrics
-    accuracy = (preds == y_true).mean()
-    prec = precision_score(y_true, preds, zero_division=0)
-    rec = recall_score(y_true, preds, zero_division=0)
+    accuracy = float((preds == y_true).mean())
+    prec = float(precision_score(y_true, preds, zero_division=0))
+    rec = float(recall_score(y_true, preds, zero_division=0))
+    f1 = float(f1_score(y_true, preds, zero_division=0))
+    f05 = float(fbeta_score(y_true, preds, beta=0.5, zero_division=0))
+    f2 = float(fbeta_score(y_true, preds, beta=2.0, zero_division=0))
     cm = confusion_matrix(y_true, preds)
     
-    # Counts
     real_vals, real_counts = np.unique(y_true, return_counts=True)
     pred_vals, pred_counts = np.unique(preds, return_counts=True)
-    real_dict = dict(zip(real_vals, real_counts))
-    pred_dict = dict(zip(pred_vals, pred_counts))
+    real_dict = {str(k): int(v) for k, v in zip(real_vals, real_counts)}
+    pred_dict = {str(k): int(v) for k, v in zip(pred_vals, pred_counts)}
     
     print(f"Test Loss:     {test_loss:.4f}")
     print(f"Test Accuracy: {accuracy:.4f}")
     print(f"Precision:     {prec:.4f}")
     print(f"Recall:        {rec:.4f}")
+    print(f"F0.5 Score:    {f05:.4f}")
+    print(f"F1 Score:      {f1:.4f}")
+    print(f"F2.0 Score:    {f2:.4f}")
     print("-" * 30)
     print(f"Real Distribution:      {real_dict}")
     print(f"Predicted Distribution: {pred_dict}")
@@ -3558,6 +3728,20 @@ def evaluate_test_set(models, forward_fn, data, pos_weight):
     print("Confusion Matrix:")
     print(cm)
     print("="*30 + "\n")
+
+    metrics = {
+        'test_loss': test_loss,
+        'test_accuracy': accuracy,
+        'precision': prec,
+        'recall': rec,
+        'f0_5_score': f05,
+        'f1_score': f1,
+        'f2_0_score': f2,
+        'confusion_matrix': cm.tolist(),
+        'real_distribution': real_dict,
+        'predicted_distribution': pred_dict,
+    }
+    return metrics
 
 
     
@@ -3827,13 +4011,15 @@ def plot_decision_boundary_slices(models, forward_fn, data, scaler, seq_len,
 
 
 #####################################################################################
-def plot_training_curves(history, output_folder=None):
+def plot_training_curves(history, output_folder=None, data=None):
     """
-    Plots the Loss and Accuracy curves after training.
+    Plots Loss and Accuracy curves (train, val) after training.
+    When data is provided, draws horizontal all-predict-0 baseline lines
+    on the accuracy subplot so you can see if the model beats majority-class.
     Optionally saves to output_folder if provided.
     """
-    epochs = range(1, len(history['val_loss']) + 1)
-    fig = plt.figure(figsize=(12, 5))
+    epochs = range(len(history['val_loss']))
+    fig = plt.figure(figsize=(14, 5))
     
     plt.subplot(1, 2, 1)
     plt.plot(epochs, history['train_loss'], label='Train')
@@ -3845,8 +4031,21 @@ def plot_training_curves(history, output_folder=None):
     plt.grid(True)
     
     plt.subplot(1, 2, 2)
+    if 'train_acc' in history and history['train_acc']:
+        plt.plot(epochs, history['train_acc'], label='Train Acc')
     plt.plot(epochs, history['val_acc'], color='green', label='Val Acc')
-    plt.title('Validation Accuracy')
+
+    if data is not None:
+        y_train = data['y_train'].cpu().numpy().flatten()
+        y_val = data['y_val'].cpu().numpy().flatten()
+        train_all0 = float((y_train == 0).mean())
+        val_all0 = float((y_val == 0).mean())
+        plt.axhline(y=train_all0, color='cyan', linestyle='--', linewidth=2,
+                     label=f'Train all-0: {train_all0:.3f}')
+        plt.axhline(y=val_all0, color='magenta', linestyle=':', linewidth=2,
+                     label=f'Val all-0: {val_all0:.3f}')
+
+    plt.title('Accuracy vs Epochs')
     plt.xlabel('Epochs')
     plt.ylabel('Accuracy')
     plt.legend()
@@ -3856,6 +4055,154 @@ def plot_training_curves(history, output_folder=None):
     if output_folder:
         save_figure(fig, output_folder, "training_curves")
     plt.show()
+
+
+def plot_f1_curve(history, output_folder=None):
+    """Standalone F1 score (train/val) vs epochs plot."""
+    if 'train_f1' not in history or len(history['train_f1']) == 0:
+        return
+    epochs = range(len(history['train_f1']))
+    fig = plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history['train_f1'], label='Train F1')
+    plt.plot(epochs, history['val_f1'], label='Val F1', linestyle='--')
+    plt.title('F1 Score vs Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('F1 Score')
+    plt.ylim([-0.05, 1.05])
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig, output_folder, "f1_score_curve")
+    plt.show()
+
+
+def plot_f05_curve(history, output_folder=None):
+    """Standalone F0.5 score (train/val) vs epochs plot."""
+    if 'train_f05' not in history or len(history['train_f05']) == 0:
+        return
+    epochs = range(len(history['train_f05']))
+    fig = plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history['train_f05'], label='Train F0.5')
+    plt.plot(epochs, history['val_f05'], label='Val F0.5', linestyle='--')
+    plt.title('F0.5 Score vs Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('F0.5 Score')
+    plt.ylim([-0.05, 1.05])
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig, output_folder, "f05_score_curve")
+    plt.show()
+
+
+def plot_f2_curve(history, output_folder=None):
+    """Standalone F2 score (train/val) vs epochs plot."""
+    if 'train_f2' not in history or len(history['train_f2']) == 0:
+        return
+    epochs = range(len(history['train_f2']))
+    fig = plt.figure(figsize=(8, 5))
+    plt.plot(epochs, history['train_f2'], label='Train F2')
+    plt.plot(epochs, history['val_f2'], label='Val F2', linestyle='--')
+    plt.title('F2 Score vs Epochs')
+    plt.xlabel('Epochs')
+    plt.ylabel('F2 Score')
+    plt.ylim([-0.05, 1.05])
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    if output_folder:
+        save_figure(fig, output_folder, "f2_score_curve")
+    plt.show()
+
+
+def save_training_summary_txt(output_folder, history, test_metrics, models, hyperparams, model_type, data):
+    """
+    Writes a combined training_summary.txt with:
+    1) Model architecture summary
+    2) Testing metrics summary
+    3) Per-epoch table (loss, acc, F1, F0.5, F2)
+    """
+    lines = []
+
+    # --- Section 1: Architecture ---
+    seq_len = data['X_train'].shape[1]
+    input_channels = data['X_train'].shape[2]
+    lines.append("=" * 90)
+    lines.append("MODEL ARCHITECTURE")
+    lines.append("=" * 90)
+    lines.append(f"Model type:      {model_type}")
+    lines.append(f"Input channels:  {input_channels}")
+    lines.append(f"Sequence length: {seq_len}")
+    lines.append("")
+    total_params = 0
+    for layer_name, layer in models.items():
+        layer_params = sum(p.numel() for p in layer.parameters() if p.requires_grad)
+        total_params += layer_params
+        lines.append(f"  {layer_name:20s} | {layer.__class__.__name__:20s} | params: {layer_params}")
+    lines.append(f"\n  TOTAL TRAINABLE PARAMS: {total_params}")
+    lines.append("")
+    lines.append("HYPERPARAMETERS:")
+    for k, v in hyperparams.items():
+        lines.append(f"  {k}: {v}")
+
+    # --- Section 2: Testing metrics ---
+    lines.append("")
+    lines.append("=" * 90)
+    lines.append("TEST SET METRICS")
+    lines.append("=" * 90)
+    if test_metrics:
+        for k, v in test_metrics.items():
+            if isinstance(v, float):
+                lines.append(f"  {k:25s}: {v:.6f}")
+            elif isinstance(v, list):
+                lines.append(f"  {k:25s}: {v}")
+            else:
+                lines.append(f"  {k:25s}: {v}")
+    else:
+        lines.append("  (no test metrics available)")
+
+    # --- Section 3: Early stopping summary ---
+    n_epochs = len(history['train_loss'])
+    best_epoch = int(np.argmin(history['val_loss']))
+    best_val_loss = history['val_loss'][best_epoch]
+    lines.append("")
+    lines.append("=" * 90)
+    lines.append("TRAINING SUMMARY")
+    lines.append("=" * 90)
+    lines.append(f"  Epochs trained:    {n_epochs}")
+    lines.append(f"  Best epoch:        {best_epoch}")
+    lines.append(f"  Best val_loss:     {best_val_loss:.6f}")
+
+    # --- Section 4: Per-epoch table ---
+    lines.append("")
+    lines.append("=" * 90)
+    lines.append("PER-EPOCH HISTORY")
+    lines.append("=" * 90)
+
+    header = (f"{'epoch':>5s} | {'tr_loss':>8s} | {'va_loss':>8s} | "
+              f"{'tr_acc':>7s} | {'va_acc':>7s} | "
+              f"{'tr_f1':>6s} | {'va_f1':>6s} | "
+              f"{'tr_f05':>6s} | {'va_f05':>6s} | "
+              f"{'tr_f2':>6s} | {'va_f2':>6s}")
+    lines.append(header)
+    lines.append("-" * len(header))
+
+    for i in range(n_epochs):
+        def _g(key, idx):
+            vals = history.get(key, [])
+            return vals[idx] if idx < len(vals) and vals[idx] is not None else float('nan')
+
+        row = (f"{i:5d} | {_g('train_loss',i):8.4f} | {_g('val_loss',i):8.4f} | "
+               f"{_g('train_acc',i):7.4f} | {_g('val_acc',i):7.4f} | "
+               f"{_g('train_f1',i):6.4f} | {_g('val_f1',i):6.4f} | "
+               f"{_g('train_f05',i):6.4f} | {_g('val_f05',i):6.4f} | "
+               f"{_g('train_f2',i):6.4f} | {_g('val_f2',i):6.4f}")
+        lines.append(row)
+
+    content = "\n".join(lines)
+    save_text_report(output_folder, "training_summary", content)
 
 
 ###########################################################################
@@ -4047,13 +4394,14 @@ def plot_decision_boundary_slices_shaded(models, forward_fn, data, scaler, seq_l
 
 def plot_test_file_trends(filepath, models, forward_fn, scaler, sequence_length, output_folder=None):
     """
-    6-row subplot:
+    7-row subplot:
     1) Real VoltageChange (0/1)
     2) Pred VoltageChange (0/1)
-    3) Real Voltage (continuous)
-    4) Current vs time
-    5) Pressure vs time
-    6) Radiation vs time
+    3) Real vs Predicted A1 (overlay)
+    4) Real Voltage (continuous)
+    5) Current vs time
+    6) Pressure vs time
+    7) Radiation vs time
     
     Optionally saves to output_folder if provided.
     """
@@ -4073,7 +4421,6 @@ def plot_test_file_trends(filepath, models, forward_fn, scaler, sequence_length,
     if time_col:
         t_raw = df[time_col].copy()
 
-        # Try numeric first, else datetime
         t_num = pd.to_numeric(t_raw, errors='coerce')
         if t_num.notna().sum() > 0:
             t = t_num.fillna(method='ffill').fillna(method='bfill')
@@ -4120,8 +4467,6 @@ def plot_test_file_trends(filepath, models, forward_fn, scaler, sequence_length,
         errors='coerce'
     )
 
-     
-
     # Voltage series (try Glassman voltage, fall back to hvps.lerec if needed)
     if 'glassmanDataXfer:hvPsVoltageMeasM' in df_clean.columns:
         hv_series = pd.to_numeric(
@@ -4134,24 +4479,27 @@ def plot_test_file_trends(filepath, models, forward_fn, scaler, sequence_length,
     else:
         hv_series = pd.Series(np.nan, index=df_clean.index)
 
+    base_name = os.path.splitext(os.path.basename(filepath))[0]
 
-    # --- Plot ---
+    # --- Trend Plot (6 rows) ---
     fig, axes = plt.subplots(6, 1, figsize=(12, 12), sharex=True)
     fig.suptitle(
-        f"Trends + Real & Pred VoltageChange (Separate Panels)\n{os.path.basename(filepath)}",
+        f"Trends + Real & Pred VoltageChange\n{os.path.basename(filepath)}",
         fontsize=14
     )
 
-       # 1) REAL VoltageChange
+    # 1) REAL VoltageChange
     axes[0].step(t.iloc[idxs], y_true, label="Real VoltageChange", where='post')
     axes[0].set_ylim(-0.1, 1.1)
-    axes[0].set_ylabel("Real 0/1")
+    axes[0].set_ylabel("Real Voltage Ramp")
+    axes[0].legend(loc='upper right', fontsize=8)
     axes[0].grid(True, alpha=0.3)
 
     # 2) PRED VoltageChange
     axes[1].step(t.iloc[idxs], preds, label="Pred VoltageChange", where='post', color='orange')
     axes[1].set_ylim(-0.1, 1.1)
-    axes[1].set_ylabel("Pred 0/1")
+    axes[1].set_ylabel("Pred Voltage Ramp")
+    axes[1].legend(loc='upper right', fontsize=8)
     axes[1].grid(True, alpha=0.3)
 
     # 3) Real Voltage (continuous)
@@ -4178,9 +4526,25 @@ def plot_test_file_trends(filepath, models, forward_fn, scaler, sequence_length,
     plt.tight_layout(rect=[0, 0, 1, 0.95])
     
     if output_folder:
-        # Create filename from the test file name
-        base_name = os.path.splitext(os.path.basename(filepath))[0]
         save_figure(fig, output_folder, f"trend_{base_name}")
+    plt.show()
+
+    # --- Standalone Real vs Predicted Plot (x-axis = elapsed steps) ---
+    x_steps = np.arange(len(y_true))
+    fig_rvp, ax_rvp = plt.subplots(figsize=(12, 4))
+    ax_rvp.step(x_steps, y_true, label="Real", where='post', linewidth=1.2)
+    ax_rvp.step(x_steps, preds, label="Predicted", where='post',
+                color='orange', linestyle='--', linewidth=1.2, alpha=0.8)
+    ax_rvp.set_ylim(-0.1, 1.1)
+    ax_rvp.set_ylabel("Voltage Ramp")
+    ax_rvp.set_xlabel("Time Steps (s)")
+    ax_rvp.set_title(f"Real vs Predicted Voltage Ramp", fontsize=12)
+    ax_rvp.legend(loc='upper right', fontsize=9)
+    ax_rvp.grid(True, alpha=0.3)
+    plt.tight_layout()
+    
+    if output_folder:
+        save_figure(fig_rvp, output_folder, f"real_vs_pred_{base_name}")
     plt.show()
 
 
@@ -4303,7 +4667,7 @@ def test_single_file_simulation(filepath, models, forward_fn, scaler, sequence_l
 
             plt.plot(
                 real_norm,
-                label='Real Voltage (normalized)',
+                label='Real Voltage (Rescaled)',
                 linestyle='--',
                 linewidth=2,
                 alpha=0.7
@@ -4319,13 +4683,13 @@ def test_single_file_simulation(filepath, models, forward_fn, scaler, sequence_l
 
     plt.plot(
         sim_norm,
-        label='Simulated Voltage (normalized)',
+        label='Simulated Voltage (Rescaled)',
         linewidth=2
     )
 
-    plt.title(f"Simulation vs Real (Normalized): {os.path.basename(filepath)}\nStep: {step_size:.2f}")
-    plt.xlabel("Time Steps")
-    plt.ylabel("Normalized Voltage (0–1)")
+    plt.title(f"Rescaled Voltage - Simulated vs Real")
+    plt.xlabel("Time Steps (s)")
+    plt.ylabel("Rescaled Voltage")
     plt.legend()
     plt.grid(True, alpha=0.3)
     
@@ -4730,7 +5094,7 @@ def create_test_ablations(X_test, y_test, missing_value=0.0):
     Returns:
         (ablations, missing_mask)
     """
-    return create_ablations(X_test, y_test, missing_value=missing_value, random_seed=97)
+    return create_ablations(X_test, y_test, missing_value=missing_value, random_seed=167)
 
 
 def evaluate_robustness(models, forward_fn, ablations, missing_mask=None, 
@@ -5433,6 +5797,7 @@ if __name__ == "__main__":
         'kernel_size': 5,
         'pool_size': 2,
         'hidden_dim': 64,  # For LSTM
+        'early_stopping_patience': 15,
         # Dropout/Missing data augmentation
         'prob_full_missing': 0.0,          # 20% chance of full window dropout
         'prob_block_missing': 0.0,         # 30% chance of block dropout
@@ -5485,7 +5850,8 @@ if __name__ == "__main__":
         prob_block_missing=HYPERPARAMS['prob_block_missing'],
         min_block_pct=HYPERPARAMS['dropout_min_block_pct'],
         max_block_pct=HYPERPARAMS['dropout_max_block_pct'],
-        missing_value=HYPERPARAMS['missing_value']
+        missing_value=HYPERPARAMS['missing_value'],
+        early_stopping_patience=HYPERPARAMS['early_stopping_patience']
     )
 
     
@@ -5644,12 +6010,36 @@ if __name__ == "__main__":
     # ==========================================
     # 6. Plot Training Curves (with saving)
     # ==========================================
-    plot_training_curves(history, output_folder=OUTPUT_FOLDER)
+    plot_training_curves(history, output_folder=OUTPUT_FOLDER, data=data)
+    plot_f1_curve(history, output_folder=OUTPUT_FOLDER)
+    plot_f05_curve(history, output_folder=OUTPUT_FOLDER)
+    plot_f2_curve(history, output_folder=OUTPUT_FOLDER)
+
+    # ==========================================
+    # 6.1 Save Epoch History Report (JSON)
+    # ==========================================
+    save_epoch_history_report(OUTPUT_FOLDER, history)
 
     # ==========================================
     # 7. Evaluate on Test Set
     # ==========================================
-    evaluate_test_set(models, fwd_fn, data, pos_weight)
+    test_metrics = evaluate_test_set(models, fwd_fn, data, pos_weight)
+
+    # ==========================================
+    # 7.1 Save Test Metrics Report (JSON) + class distributions + pos_weight
+    # ==========================================
+    if test_metrics:
+        save_test_metrics_report(OUTPUT_FOLDER, test_metrics, data, pos_weight)
+
+    # ==========================================
+    # 7.2 Save Model Architecture Report (JSON)
+    # ==========================================
+    save_model_architecture_report(OUTPUT_FOLDER, models, HYPERPARAMS, MODEL_TYPE, data)
+
+    # ==========================================
+    # 7.3 Save Combined Training Summary (TXT)
+    # ==========================================
+    save_training_summary_txt(OUTPUT_FOLDER, history, test_metrics, models, HYPERPARAMS, MODEL_TYPE, data)
 
     _san_buf = io.StringIO()
     _tee_san = TeeWriter(sys.stdout, _san_buf)
@@ -5860,6 +6250,10 @@ if __name__ == "__main__":
     print(f"  - temporal_sensitivity_test.png (Spike position sensitivity)")
     print(f"  - training_curves.png")
     print(f"  - trend_*.png, simulation_*.png (Per test file)")
+    print(f"\nReports:")
+    print(f"  - {OUTPUT_FOLDER}/epoch_history.json       (per-epoch train/val/test metrics)")
+    print(f"  - {OUTPUT_FOLDER}/test_metrics.json        (F0.5, F1, F2 + class distributions)")
+    print(f"  - {OUTPUT_FOLDER}/model_architecture.json  (layer table + hyperparameters)")
     print(f"\nCheckpoints:")
     print(f"  - {OUTPUT_FOLDER}/checkpoint.pth      (lightweight)")
     print(f"  - {OUTPUT_FOLDER}/full_checkpoint.pth (complete)")
