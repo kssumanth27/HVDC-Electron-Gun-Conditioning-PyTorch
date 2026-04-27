@@ -1206,7 +1206,7 @@ def init_kaiming_normal_for_conv(m):
         if m.bias is not None:
             nn.init.zeros_(m.bias)
 
-def forward_cnn(models, x):
+def forward_cnn(models, x, activation_store=None):
     # Permute: PyTorch Conv1d expects [Batch, Channels, Time]
     x = x.permute(0, 2, 1)
 
@@ -1233,6 +1233,10 @@ def forward_cnn(models, x):
     x = models['conv1'](x)
     x = models['bn1'](x)
     x = F.relu(x)
+    if activation_store is not None:
+        x.retain_grad()
+        activation_store['conv1_post_relu'] = x
+        x.register_hook(lambda grad, store=activation_store: store.__setitem__('conv1_post_relu_grad', grad))
     x = models['pool'](x)
 
     if 'conv_fuse' in models:
@@ -1243,6 +1247,10 @@ def forward_cnn(models, x):
     x = models['conv2'](x)
     x = models['bn2'](x)
     x = F.relu(x)
+    if activation_store is not None:
+        x.retain_grad()
+        activation_store['conv2_post_relu'] = x
+        x.register_hook(lambda grad, store=activation_store: store.__setitem__('conv2_post_relu_grad', grad))
     x = models['pool'](x)
     
     x = x.reshape(x.size(0), -1)
@@ -3731,6 +3739,308 @@ def temporal_sensitivity_test(models, forward_fn, scaler, seq_len, output_folder
 
 
 # ==========================================
+# 5.2 Grad-CAM (1D, binary one-logit)
+# ==========================================
+def _normalize_cam_1d(cam, eps=1e-8):
+    cam = np.asarray(cam, dtype=np.float32)
+    if cam.size == 0:
+        return cam
+    cam = cam - cam.min()
+    denom = cam.max() - cam.min()
+    if denom < eps:
+        return np.zeros_like(cam, dtype=np.float32)
+    return cam / (denom + eps)
+
+
+def _upsample_cam_1d(cam, target_len):
+    cam = np.asarray(cam, dtype=np.float32).ravel()
+    if cam.size == target_len:
+        return cam
+    x_src = np.linspace(0.0, 1.0, num=cam.size)
+    x_tgt = np.linspace(0.0, 1.0, num=target_len)
+    return np.interp(x_tgt, x_src, cam).astype(np.float32)
+
+
+def _zero_all_model_grads(models):
+    for layer in models.values():
+        if hasattr(layer, "zero_grad"):
+            layer.zero_grad(set_to_none=True)
+
+
+class GradCAM1D:
+    """
+    Grad-CAM for binary one-logit 1D CNN.
+    Captures post-BN/post-ReLU activations from forward_cnn via activation_store.
+    """
+    def __init__(self, models, forward_fn):
+        self.models = models
+        self.forward_fn = forward_fn
+        self.hook_handles = []
+
+    def remove_hooks(self):
+        # Kept for API compatibility. No module hooks are used in this post-ReLU design.
+        for h in self.hook_handles:
+            h.remove()
+        self.hook_handles = []
+
+    def generate(self, x_one, target_class=1):
+        """
+        x_one: [1, seq_len, 4]
+        target_class: 1 -> score=logit, 0 -> score=-logit
+        """
+        if x_one.shape[0] != 1:
+            raise ValueError(f"Grad-CAM expects one sample, got batch={x_one.shape[0]}")
+
+        for layer in self.models.values():
+            layer.eval()
+
+        activation_store = {}
+        _zero_all_model_grads(self.models)
+
+        with torch.enable_grad():
+            try:
+                logits = self.forward_fn(self.models, x_one, activation_store=activation_store)
+            except TypeError:
+                raise RuntimeError(
+                    "forward_cnn must accept activation_store for post-ReLU Grad-CAM."
+                )
+
+            logit_scalar = logits.view(-1)[0]
+            score = logit_scalar if int(target_class) == 1 else -logit_scalar
+            score.backward()
+
+        if "conv1_post_relu" not in activation_store or "conv2_post_relu" not in activation_store:
+            raise RuntimeError("Missing Grad-CAM activations. Ensure forward_cnn stores post-ReLU tensors.")
+
+        a1 = activation_store["conv1_post_relu"].detach()             # [1, 128, T1]
+        g1_raw = activation_store.get("conv1_post_relu_grad", activation_store["conv1_post_relu"].grad)
+        g1 = g1_raw.detach()                                           # [1, 128, T1]
+        a2 = activation_store["conv2_post_relu"].detach()             # [1, 256, T2]
+        g2_raw = activation_store.get("conv2_post_relu_grad", activation_store["conv2_post_relu"].grad)
+        g2 = g2_raw.detach()                                           # [1, 256, T2]
+
+        # Standard Grad-CAM channel weights: global average over time
+        w1 = g1.mean(dim=2, keepdim=True)                             # [1, 128, 1]
+        w2 = g2.mean(dim=2, keepdim=True)                             # [1, 256, 1]
+
+        cam1_all = torch.relu((w1 * a1).sum(dim=1)).squeeze(0).cpu().numpy()  # [T1]
+        cam2 = torch.relu((w2 * a2).sum(dim=1)).squeeze(0).cpu().numpy()       # [T2]
+
+        grouped = {}
+        group_slices = {
+            "Current": (0, 32),
+            "Pressure": (32, 64),
+            "Radiation": (64, 96),
+            "Prev_A1": (96, 128),
+        }
+        for name, (s, e) in group_slices.items():
+            cam_group = torch.relu((w1[:, s:e, :] * a1[:, s:e, :]).sum(dim=1))
+            grouped[name] = _normalize_cam_1d(cam_group.squeeze(0).cpu().numpy())
+
+        return {
+            "logit": float(logit_scalar.detach().cpu().item()),
+            "score": float(score.detach().cpu().item()),
+            "target_class": int(target_class),
+            "cam_conv1_all": _normalize_cam_1d(cam1_all),
+            "cam_conv1_groups": grouped,
+            "cam_conv2": _normalize_cam_1d(cam2),
+        }
+
+
+def _pick_first_index(arr):
+    idx = np.where(arr)[0]
+    return int(idx[0]) if len(idx) > 0 else None
+
+
+def find_confusion_sample_indices(models, forward_fn, X_test, y_test):
+    """Return one representative index for TP/TN/FP/FN."""
+    for layer in models.values():
+        layer.eval()
+
+    with torch.inference_mode():
+        logits = forward_fn(models, X_test)
+        preds = (logits > 0).long().cpu().numpy().ravel()
+
+    y_true = y_test.long().cpu().numpy().ravel()
+    out = {
+        "TP": _pick_first_index((y_true == 1) & (preds == 1)),
+        "TN": _pick_first_index((y_true == 0) & (preds == 0)),
+        "FP": _pick_first_index((y_true == 0) & (preds == 1)),
+        "FN": _pick_first_index((y_true == 1) & (preds == 0)),
+    }
+    return out
+
+
+def plot_gradcam_sample(
+    x_one,
+    y_true,
+    y_pred,
+    case_name,
+    sample_idx,
+    cam_results,
+    output_folder=None,
+):
+    """Plot one sample: raw inputs + conv1 feature-time heatmap + conv2 time heatmap."""
+    x_np = x_one.detach().cpu().numpy()[0]  # [T, 4]
+    seq_len = x_np.shape[0]
+    t = np.arange(seq_len)
+
+    conv1_groups = cam_results["cam_conv1_groups"]
+    cam2_up = _upsample_cam_1d(cam_results["cam_conv2"], seq_len)
+    conv1_feature_time = np.vstack([
+        _upsample_cam_1d(conv1_groups[name], seq_len)
+        for name in CHANNEL_NAMES
+    ])
+    conv2_time = cam2_up.reshape(1, -1)
+
+    fig = plt.figure(figsize=(14, 8))
+    gs = fig.add_gridspec(3, 1, height_ratios=[1.4, 1.2, 0.7], hspace=0.45)
+
+    ax0 = fig.add_subplot(gs[0, 0])
+    for ch, name in enumerate(CHANNEL_NAMES):
+        ax0.plot(t, x_np[:, ch], linewidth=1.4, label=name)
+    ax0.set_title(
+        f"Grad-CAM | {case_name} | idx={sample_idx} | y={int(y_true)} pred={int(y_pred)} "
+        f"| target={cam_results['target_class']} | logit={cam_results['logit']:.4f}"
+    )
+    ax0.set_ylabel("Input")
+    ax0.grid(True, alpha=0.25)
+    ax0.legend(loc="upper right", ncol=4, fontsize=8)
+
+    ax1 = fig.add_subplot(gs[1, 0])
+    im1 = ax1.imshow(
+        conv1_feature_time,
+        aspect="auto",
+        cmap="viridis",
+        vmin=0.0,
+        vmax=1.0,
+        extent=[-0.5, seq_len - 0.5, len(CHANNEL_NAMES) - 0.5, -0.5],
+        interpolation="nearest",
+    )
+    ax1.set_title("Conv1 Grad-CAM: Feature-Specific Saliency Over Time")
+    ax1.set_ylabel("Feature")
+    ax1.set_yticks(np.arange(len(CHANNEL_NAMES)))
+    ax1.set_yticklabels(CHANNEL_NAMES)
+    ax1.set_xticks(t)
+    ax1.set_xlabel("Time Step")
+    cbar1 = fig.colorbar(im1, ax=ax1, fraction=0.025, pad=0.02)
+    cbar1.set_label("Normalized saliency")
+
+    ax2 = fig.add_subplot(gs[2, 0])
+    im2 = ax2.imshow(
+        conv2_time,
+        aspect="auto",
+        cmap="magma",
+        vmin=0.0,
+        vmax=1.0,
+        extent=[-0.5, seq_len - 0.5, 0.5, -0.5],
+        interpolation="nearest",
+    )
+    ax2.set_title("Conv2 Grad-CAM: Fused Temporal Saliency")
+    ax2.set_yticks([0])
+    ax2.set_yticklabels(["Conv2 fused"])
+    ax2.set_xticks(t)
+    ax2.set_xlabel("Time Step")
+    cbar2 = fig.colorbar(im2, ax=ax2, fraction=0.025, pad=0.02)
+    cbar2.set_label("Normalized saliency")
+
+    if output_folder:
+        fname = (
+            f"gradcam_{case_name}_idx_{sample_idx}_true_{int(y_true)}_pred_{int(y_pred)}"
+            f"_target_{cam_results['target_class']}"
+        )
+        save_figure(fig, output_folder, fname)
+    plt.show()
+
+
+def run_gradcam_for_confusion_examples(models, forward_fn, data, output_folder=None):
+    """
+    Run Grad-CAM on one sample each from TP/TN/FP/FN (if available).
+    """
+    X_test = data["X_test"]
+    y_test = data["y_test"]
+    if len(X_test) == 0:
+        print("Grad-CAM skipped: empty test set.")
+        return {}
+
+    case_to_idx = find_confusion_sample_indices(models, forward_fn, X_test, y_test)
+    print("\n>>> Grad-CAM sample selection:", case_to_idx)
+
+    cam = GradCAM1D(models, forward_fn)
+    outputs = {}
+    try:
+        for case_name, idx in case_to_idx.items():
+            if idx is None:
+                print(f"Grad-CAM: no sample found for {case_name}.")
+                continue
+
+            x_one = X_test[idx:idx+1]
+            y_true = int(y_test[idx].item())
+
+            with torch.inference_mode():
+                logit = forward_fn(models, x_one).view(-1)[0].item()
+                y_pred = int(logit > 0.0)
+
+            # Explain predicted class:
+            # class 1 -> score=logit, class 0 -> score=-logit
+            target_class = y_pred
+            cam_results = cam.generate(x_one, target_class=target_class)
+            png_name = (
+                f"gradcam_{case_name}_idx_{idx}_true_{int(y_true)}_pred_{int(y_pred)}"
+                f"_target_{cam_results['target_class']}.png"
+            )
+            outputs[case_name] = {
+                "idx": idx,
+                "y_true": y_true,
+                "y_pred": y_pred,
+                "png_file": png_name,
+                "cam": cam_results,
+            }
+
+            plot_gradcam_sample(
+                x_one=x_one,
+                y_true=y_true,
+                y_pred=y_pred,
+                case_name=case_name,
+                sample_idx=idx,
+                cam_results=cam_results,
+                output_folder=output_folder,
+            )
+    finally:
+        cam.remove_hooks()
+
+    return outputs
+
+
+def save_gradcam_summary_report(output_folder, gradcam_outputs):
+    """Save a concise text summary of Grad-CAM outputs."""
+    lines = [
+        "=" * 90,
+        "GRAD-CAM CONFUSION-CASE SUMMARY",
+        "=" * 90,
+        "Columns: case | sample_idx | y_true | y_pred | target_class | logit | score | png_file",
+        "-" * 90,
+    ]
+
+    for case_name in ["TP", "TN", "FP", "FN"]:
+        row = gradcam_outputs.get(case_name)
+        if row is None:
+            lines.append(f"{case_name}\tN/A\tN/A\tN/A\tN/A\tN/A\tN/A\tN/A")
+            continue
+
+        cam = row["cam"]
+        lines.append(
+            f"{case_name}\t{row['idx']}\t{row['y_true']}\t{row['y_pred']}\t"
+            f"{cam['target_class']}\t{cam['logit']:.8f}\t{cam['score']:.8f}\t{row['png_file']}"
+        )
+
+    lines.append("-" * 90)
+    lines.append(f"Generated cases: {len(gradcam_outputs)}")
+    lines.append("")
+    save_text_report(output_folder, "gradcam_summary", "\n".join(lines))
+
+
+# ==========================================
 # 5.2 Evaluation Metrics 
 # ==========================================
 
@@ -5740,13 +6050,13 @@ if __name__ == "__main__":
     # ==========================================
     HYPERPARAMS = {
         'sequence_length': 30,
-        'learning_rate': 0.0000005,
+        'learning_rate': 0.000005,
         'epochs': 30,
         'batch_size': 128,
-        'cnn_architecture': 'split_fusion_3plus1',
-        'n_filters1': 150,
-        'fusion_channels': 200,
-        'n_filters2': 250,
+        'cnn_architecture': 'mid_fusion_pointwise',
+        'n_filters1': 128,
+        'fusion_channels': 128,
+        'n_filters2': 256,
         'kernel_size': 7,
         'pool_size': 2,                      #'mid_fusion_pointwise' or 'split_fusion_3plus1' or 'early_fusion'
         'branch2_filters': 150,             # split_fusion_3plus1: filters per branch in conv2
@@ -5982,6 +6292,15 @@ if __name__ == "__main__":
     # 7. Evaluate on Test Set
     # ==========================================
     evaluate_test_set(models, fwd_fn, data, pos_weight, output_folder=OUTPUT_FOLDER)
+    print("\n>>> Running Grad-CAM on TP/TN/FP/FN examples...")
+    gradcam_outputs = run_gradcam_for_confusion_examples(
+        models=models,
+        forward_fn=fwd_fn,
+        data=data,
+        output_folder=OUTPUT_FOLDER,
+    )
+    print(f">>> Grad-CAM generated for {len(gradcam_outputs)} confusion categories.")
+    save_gradcam_summary_report(OUTPUT_FOLDER, gradcam_outputs)
     save_test_probability_report(
         OUTPUT_FOLDER,
         models,
