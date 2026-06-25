@@ -6,7 +6,7 @@ import threading
 import time
 from pathlib import Path
 from typing import Dict, List
-
+from datetime import datetime
 from p4p.nt import NTScalar
 from p4p.server import Server
 from p4p.server.thread import SharedPV
@@ -24,15 +24,15 @@ NT_DOUBLE = NTScalar("d")
 # The server will read these CSV columns and publish one row at a time.
 PV_CONFIG = {
     "example:current": {
-        "file": r"C:\Users\skantamne\Downloads\PhD EGun\Data\EPICS_test\processed_polgun_voltage_11042020_hz_combined_uptoMax_plus10.csv",
+        "file": r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\test poster\processed_polgun_voltage_11042020_hz_combined_uptoMax_plus10.csv",
         "column": "GunCurrent.Avg",
     },
     "example:pressure": {
-        "file": r"C:\Users\skantamne\Downloads\PhD EGun\Data\EPICS_test\processed_polgun_voltage_11042020_hz_combined_uptoMax_plus10.csv",
+        "file": r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\test poster\processed_polgun_voltage_11042020_hz_combined_uptoMax_plus10.csv",
         "column": "peg-BL-cc:pressureM",
     },
     "example:radiation": {
-        "file": r"C:\Users\skantamne\Downloads\PhD EGun\Data\EPICS_test\processed_polgun_voltage_11042020_hz_combined_uptoMax_plus10.csv",
+        "file": r"C:\Users\suman\Downloads\Stony Brook\PhD\Electron Gun\Data\Archive 2\polgun v8 until max conditioning\v8 spikes cleaned until max\test poster\processed_polgun_voltage_11042020_hz_combined_uptoMax_plus10.csv",
         "column": "RadiationTotal",
     },
 }
@@ -154,7 +154,8 @@ class VoltageAdvanceHandler:
 
             # One timestamp for the entire update batch keeps the monitors aligned.
             ts = time.time()
-
+            # Convert the timestamp to a readable local time string for logging.
+            post_time = datetime.fromtimestamp(ts)
             # Store the latest voltage so the server can report it.
             self.state["voltage"] = new_voltage
 
@@ -178,12 +179,15 @@ class VoltageAdvanceHandler:
             print()
             print("=" * 60)
             print(f"SERVER STEP {row_index}")
-            print(f"Voltage PUT received : {new_voltage}")
-            print(f"Current published    : {current_value}")
-            print(f"Pressure published   : {pressure_value}")
-            print(f"Radiation published  : {radiation_value}")
+            print(f"Server received PUT/post time : {post_time}")
+            print(f"Voltage received from client  : {new_voltage}")
+            print(f"Voltage posted                : {new_voltage}")
+            print(f"Current posted                : {current_value}")
+            print(f"Pressure posted               : {pressure_value}")
+            print(f"Radiation posted              : {radiation_value}")
+            print(f"Row acknowledgment posted     : {self.state['row_index']}")
             print("=" * 60)
-            print()
+            print(flush=True)
 
             # Advance the server row counter by exactly one.
             self.state["row_index"] = row_index + 1
